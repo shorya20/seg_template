@@ -41,7 +41,7 @@ class SaveImageWithOriginalMetadatad(MapTransform):
         self.print_log = print_log
         self.resample_full_volume = resample_full_volume
         self.output_dir.mkdir(parents=True, exist_ok=True)
-    
+        
     def __call__(self, data):
         d = dict(data)
         for key in self.key_iterator(d):
@@ -50,12 +50,18 @@ class SaveImageWithOriginalMetadatad(MapTransform):
                 continue
 
             # Get metadata from the prediction tensor
-            if not isinstance(pred_tensor, MetaTensor) or not hasattr(pred_tensor, 'meta'):
-                print(f"Warning: {key} is not a MetaTensor with metadata, skipping")
-                continue
+            if isinstance(pred_tensor, MetaTensor) and hasattr(pred_tensor, 'meta'):
+                meta = pred_tensor.meta
+            else:
+                # Fall back to dictionary meta if MetaTensor meta is not available
+                meta = d.get(f"{key}_meta_dict", {}) or d.get("image_meta_dict", {})
+                if not meta:
+                    print(f"Warning: {key} has no metadata available, skipping")
+                    continue
 
-            meta = pred_tensor.meta
             filename = meta.get('filename_or_obj', 'unknown')
+            if isinstance(filename, (list, tuple)) and len(filename) > 0:
+                filename = filename[0]
             
             # Read JSON metadata for coordinate system info
             meta_path = Path(str(filename).replace('.npy', '_meta.json'))
@@ -84,7 +90,6 @@ class SaveImageWithOriginalMetadatad(MapTransform):
             # Ensure binary prediction
             if pred_np.dtype not in (np.uint8, np.int16, np.int32):
                 pred_np = (pred_np > 0.5).astype(np.uint8)
-
             # Resample prediction to original space
             nonzero_coords = np.where(pred_np > 0)
             # Precompute bbox indices if any non-zero voxels exist to avoid undefined locals later

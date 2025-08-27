@@ -73,9 +73,12 @@ python -m seg.training \
     --model_name AttentionUNet \
     --patch_size 128 \
     --loss_func DiceLoss \
-    --resume_from_checkpoint outputs/DiceLoss_ATM22_8_9_11_AttentionUNet_prtrFalse_AdamW_128_b1_p7_0.0001_alpha0.3_r_d1.0r_l0.7ReduceLROnPlateau/model/best_metric_model_22-0.7134.ckpt \
     --optimizer AdamW \
     --num_workers 1 \
+    --resume_from_checkpoint "outputs/DiceLoss_ATM22_8_24_16_AttentionUNet_prtrFalse_AdamW_128_b1_p7_0.0001_alpha0.3_r_d1.0r_l0.7WarmupCosineSchedule/model/best_metric_model_23-0.2383.ckpt" \
+    --finetune_from "outputs/DiceLoss_ATM22_8_24_16_AttentionUNet_prtrFalse_AdamW_128_b1_p7_0.0001_alpha0.3_r_d1.0r_l0.7WarmupCosineSchedule/model/best_metric_model_23-0.2383.ckpt" \
+    --scheduler WarmupCosineSchedule \
+    --lr 3e-5 \
     --mixed \
     --training \
     --max_epochs 50

@@ -77,6 +77,12 @@ import os
 
 from seg.utils import find_file_in_path, get_folder_names
 
+# NEW: optional patch bank sampler
+try:
+    from .patch_bank_sampler import SamplePatchFromBankd  # type: ignore
+except Exception:
+    SamplePatchFromBankd = None  # type: ignore
+
 
 # class MaskLabelsWithLungd(MapTransform):
 #     """
@@ -311,7 +317,12 @@ class SegmentationDataModule(pl.LightningDataModule):
             self.patch_size = (self.patch_size,) * 3
         print(f"Patch size: {self.patch_size}")
 
-
+        # NEW knobs
+        self.use_patch_bank_sampling = bool(self.params.get("USE_PATCH_BANK_SAMPLING", True))
+        self.patch_banks_dir = self.params.get("PATCH_BANKS_DIR", str(Path(self.data_path) / "patch_banks"))
+        self.sampler_pos_ratio = float(self.params.get("SAMPLER_POS_RATIO", 0.9))
+        self.sampler_temperature = float(self.params.get("SAMPLER_TEMPERATURE", 1.0))
+        self.sampler_fg_threshold = float(self.params.get("SAMPLER_FG_THRESHOLD", 4.72e-05))  # locked q25
         # Initialize file lists
         self.train_files = []
         self.val_files = []
@@ -431,23 +442,13 @@ class SegmentationDataModule(pl.LightningDataModule):
             EnsureChannelFirstd(keys=img_label_keys, allow_missing_keys=True),
             EnsureTyped(keys=['image', 'lung', 'label'], track_meta=True, allow_missing_keys=True),
         ])
-        # Apply Orientationd to all stages for consistency
-        transforms_list.append(
-            Orientationd(keys=img_label_keys, axcodes="RAS", allow_missing_keys=True)
-        )
+        # IMPORTANT: apply Orientationd before sampling if using RandCrop, but AFTER sampling if using patch-bank
+        if not self.use_patch_bank_sampling:
+            transforms_list.append(
+                Orientationd(keys=img_label_keys, axcodes="RAS", allow_missing_keys=True)
+            )
         
-        # Apply Spacingd to all stages to ensure model receives data at the trained spacing.
-        # This is critical for preventing train/test skew.
-        # transforms_list.append(
-        #     Spacingd(
-        #         keys=img_label_keys,
-        #         pixdim=(2.0, 2.0, 2.0),
-        #         mode=interpolation_modes,
-        #         allow_missing_keys=True,
-        #     )
-        # )
-        
-        # ---- Intensity scaling and type casting ----
+        # Intensity scaling
         transforms_list.append(
             ScaleIntensityRanged(
                 keys=["image"], a_min=-1000, a_max=400, b_min=0.0, b_max=1.0, clip=True,
@@ -455,12 +456,11 @@ class SegmentationDataModule(pl.LightningDataModule):
         )
 
         if stage=="train":
-            transforms_list.append(
-                CropForegroundd(keys=img_label_keys, source_key="lung", allow_missing_keys=True, margin=[1,1,1])
-            )
-            # IMPORTANT: Do NOT mask labels with lungs during training/validation.
-            # Masking removed a large proportion of foreground voxels due to imperfect lung masks,
-            # causing empty or almost-empty labels and near-zero IoU. Cropping by lung is sufficient.
+            # If using patch-bank, avoid CropForegroundd here (we will extract exact ROI positions)
+            if not self.use_patch_bank_sampling:
+                transforms_list.append(
+                    CropForegroundd(keys=img_label_keys, source_key="lung", allow_missing_keys=True, margin=[1,1,1])
+                )
         elif stage=="val":
             transforms_list.append(
                 CropForegroundd(keys=img_label_keys, source_key="lung", allow_missing_keys=True, margin=[1,1,25])
@@ -469,15 +469,18 @@ class SegmentationDataModule(pl.LightningDataModule):
             transforms_list.append(
                 CropForegroundd(keys=img_label_keys, source_key="lung", allow_smaller = True, margin=[1,1,50])
             )
-
-        # Decide dtype for image tensor: use requested compute dtype *except* during the
-        # test phase (and any non-mixed precision run) to avoid mismatched FP16 inputs
-        # when the model remains in FP32.  This prevents the "Input type (Half) and bias
-        # type (float) should be the same" runtime error seen during evaluation.
+        
+        # If using patch-bank, orient AFTER sampling to keep bank coordinates consistent with raw processed grid
+        if self.use_patch_bank_sampling:
+            transforms_list.append(
+                Orientationd(keys=img_label_keys, axcodes="RAS", allow_missing_keys=True)
+            )
+        
+        # dtype choice
         if stage == "train" and self.compute_dtype == torch.float16:
             image_dtype = torch.float16
         else:
-            image_dtype = torch.float32  # conservative – keeps dtype compatible with FP32 model
+            image_dtype = torch.float32
         
         return transforms_list
 
@@ -486,27 +489,48 @@ class SegmentationDataModule(pl.LightningDataModule):
         img_keys = ["image"]
         
         transforms = []
-        
+        print(f"use_patch_bank_sampling: {self.use_patch_bank_sampling}")
+        print(f"patch_banks_dir: {self.patch_banks_dir}")
+        print(f"sampler_pos_ratio: {self.sampler_pos_ratio}")
+        print(f"sampler_temperature: {self.sampler_temperature}")
+        print(f"sampler_fg_threshold: {self.sampler_fg_threshold}")
         if stage == "train":
-            transforms.append(
-                SpatialPadd(
-                keys=img_label_keys,
-                spatial_size=self.patch_size,
-                method="symmetric",
-                mode="constant",
-                allow_missing_keys=True
-                )
-            )
-            transforms.append(
-                    RandCropByPosNegLabeld(
-                        keys=img_label_keys,
-                        label_key="label",
-                        spatial_size=self.patch_size,
-                        pos=8, neg=1, num_samples=1,
-                        allow_missing_keys=True,
-                        allow_smaller=True
+            # If using patch-bank sampling, do not add SpatialPadd here; we will crop exact patches
+            if not self.use_patch_bank_sampling:
+                transforms.append(
+                    SpatialPadd(
+                    keys=img_label_keys,
+                    spatial_size=self.patch_size,
+                    method="symmetric",
+                    mode="constant",
+                    allow_missing_keys=True
                     )
-            )
+                )
+            # Sampler selection
+            if self.use_patch_bank_sampling and SamplePatchFromBankd is not None:
+                transforms.append(
+                    SamplePatchFromBankd(
+                        keys=img_label_keys,
+                        patch_banks_dir=self.patch_banks_dir,
+                        spatial_size=tuple(int(v) for v in self.patch_size),
+                        num_samples=1,
+                        pos_ratio=self.sampler_pos_ratio,
+                        temperature=self.sampler_temperature,
+                        fg_threshold=self.sampler_fg_threshold,
+                        allow_missing_keys=True,
+                    )
+                )
+            else:
+                transforms.append(
+                        RandCropByPosNegLabeld(
+                            keys=img_label_keys,
+                            label_key="label",
+                            spatial_size=self.patch_size,
+                            pos=8, neg=1, num_samples=1,
+                            allow_missing_keys=True,
+                            allow_smaller=True
+                        )
+                )
             
         elif stage == "val":
             transforms.extend([
@@ -689,9 +713,19 @@ class SegmentationDataModule(pl.LightningDataModule):
         If metric_testing is enabled, it returns the validation split of the training data (with labels).
         Otherwise, it returns the official test set (without labels).
         """
+        # Allow choosing which dataset to iterate
+        chosen = (self.args.test_dataset if self.args and hasattr(self.args, 'test_dataset') else 'off_val')
         if self.args and self.args.metric_testing:
-            print("Metric testing enabled: DataModule is providing the validation dataloader for the 'test' stage.")
-            return self.aff_training_val_dataloader()
+            if chosen == 'val':
+                print("Metric testing enabled: using validation split (with labels) for the 'test' stage.")
+                return self.aff_training_val_dataloader()
+            else:
+                print("Metric testing enabled: using official validation set (off_val) for the 'test' stage.")
+                return self._create_test_dataloader(self.off_val_ds, self.test_batch_size, shuffle=False)
         else:
-            print("Inference mode: DataModule is providing the official test dataloader for the 'test' stage.")
-            return self._create_test_dataloader(self.test_ds, self.test_batch_size, shuffle=False)
+            if chosen == 'val':
+                print("Inference mode: using validation split (with labels) for the 'test' stage.")
+                return self.aff_training_val_dataloader()
+            else:
+                print("Inference mode: using official validation set (off_val) for the 'test' stage.")
+                return self._create_test_dataloader(self.test_ds, self.test_batch_size, shuffle=False)

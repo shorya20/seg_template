@@ -67,6 +67,7 @@ from monai.transforms import (
     MapLabelValued,
     Lambdad
 )
+from monai.optimizers import WarmupCosineSchedule
 from dotenv import load_dotenv, find_dotenv
 import csv
 import resource
@@ -184,7 +185,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=int(os.getenv('BATCH_SIZE', '1')), help="size of dataset")
     parser.add_argument("--num_workers", type=int, default=int(os.getenv('NUM_WORKERS', '4')), help="Number of DataLoader workers")
     parser.add_argument("--prefetch_factor", type=int, default=int(os.getenv('PREFETCH_FACTOR', '2')), help="Prefetch factor for DataLoader")
-
+    
     # Memory optimization
     parser.add_argument("--gradient_checkpointing", action="store_true", default=bool(os.getenv('GRADIENT_CHECKPOINTING', False)), 
                         help="Enable gradient checkpointing to save memory")
@@ -220,10 +221,18 @@ def parse_args():
     parser.add_argument("--validation", action="store_true", help="Run validation phase")
     parser.add_argument("--testing", action="store_true", help="Run inference to generate predictions.")
     parser.add_argument("--metric_testing", action="store_true", help="Run testing on a labeled dataset to calculate metrics.")
+    parser.add_argument("--test_dataset", type=str, default=os.getenv('TEST_DATASET', 'off_val'), choices=['off_val','val'], help="Which dataset to use for test stage: off_val (official val without GT) or val (validation split of training with GT)")
     parser.add_argument("--awc_val", action="store_true", help="Run awc validation phase")
     
     # Resume training option
     parser.add_argument("--resume_from_checkpoint", type=str, default="", help="Path to checkpoint to resume training from")
+    # Fine-tune from checkpoint (weights-only)
+    parser.add_argument(
+        "--finetune_from",
+        type=str,
+        default="",
+        help="Path to checkpoint to fine-tune from (loads weights only, re-inits optimizer/scheduler)",
+    )
 
     args = parser.parse_args()
     args.use_pretrained = args.weights_path != ""
@@ -325,6 +334,12 @@ params_dict = {
     'MIN_DISTAL_COMPONENT_SIZE': int(os.getenv('MIN_DISTAL_COMPONENT_SIZE', '1')),
     'MAX_CACHE_MEMORY_MB': int(os.getenv('MAX_CACHE_MEMORY_MB', '15000')),
     'FORCE_CACHE_NUM': int(os.getenv('FORCE_CACHE_NUM', '0')),
+    'TEST_DATASET': args.test_dataset,
+    'USE_PATCH_BANK_SAMPLING': bool(os.getenv('USE_PATCH_BANK_SAMPLING', 'True').lower() == 'true'),
+    'PATCH_BANKS_DIR': os.getenv('PATCH_BANKS_DIR', './ATM22/npy_files/patch_banks/'),
+    'SAMPLER_POS_RATIO': float(os.getenv('SAMPLER_POS_RATIO', '0.9')),
+    'SAMPLER_TEMPERATURE': float(os.getenv('SAMPLER_TEMPERATURE', '1.0')),
+    'SAMPLER_FG_THRESHOLD': float(os.getenv('SAMPLER_FG_THRESHOLD', '4.72e-05')),
 }
 
 # Update params dict with SmartCache settings if enabled
@@ -463,6 +478,10 @@ class SegmentationNet(pl.LightningModule):
         
         # Add airway-specific metrics
         self.airway_metrics = AirwayMetrics(include_background=True)
+        
+        # Toggle for heavy topology metrics to avoid long runtimes during validation
+        self.topo_debug_mode = os.getenv('DEBUG_TOPOLOGY_METRICS', 'none').lower()
+        self.enable_topology_metrics = self.topo_debug_mode not in ('none',)
         
         # Set up data module
         self.data_module = data_module
@@ -621,11 +640,13 @@ class SegmentationNet(pl.LightningModule):
                 print(f"Error setting up CosineAnnealing scheduler: {e}")
                 print("Falling back to optimizer without scheduler")
                 return opt
-        elif args.scheduler == "CosineAnnealingWarmRestarts":
+        elif args.scheduler == "WarmupCosineSchedule":
             # Warm restarts per PyTorch docs
             # https://pytorch.org/docs/stable/generated/torch.optim.lr_scheduler.CosineAnnealingWarmRestarts.html
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                opt, T_0=10, T_mult=2, eta_min=max(1e-7, float(args.lr) * 0.1)
+            scheduler = WarmupCosineSchedule(
+                optimizer=opt,
+                warmup_steps=int(0.05 * total_steps),
+                t_total=total_steps,
             )
             return {
                 "optimizer": opt,
@@ -851,16 +872,12 @@ class SegmentationNet(pl.LightningModule):
             if batch_idx == 0 or batch_idx % 50 == 0:
                 print(f"Training - Input Shape: {inputs.shape}, Label Shape: {labels.shape}")
 
-            # Check for empty labels - but don't skip, let model learn from negative examples
+            # Check for empty labels
             label_sum = torch.sum(labels > 0).item()
-            if label_sum == 0:
-                if self.current_epoch > 10:  # After warmup, skip these batches
-                    print(f"WARNING: Batch {batch_idx} has no positive labels. Skipping batch.")
-                    return None
-                else:
-                    # During warmup, process but warn
-                    print(f"INFO: Batch {batch_idx} has no positive labels (warmup phase).")
-
+            bg_only_batch = (label_sum == 0)
+            if bg_only_batch and (batch_idx == 0 or batch_idx % 50 == 0):
+                print(f"INFO: Batch {batch_idx} has no positive labels. Using background-only BCE loss.")
+                
             # Only load additional data (lungs, weights) if needed by the loss function
             if args.loss_func in ['GUL', 'BEL', 'CBEL']:
                 lungs = batch["lung"].to(self._device, non_blocking=True) if "lung" in batch else None
@@ -877,29 +894,36 @@ class SegmentationNet(pl.LightningModule):
                 if batch_idx == 0 or batch_idx % 50 == 0:
                     print(f"Training - Model Output Shape: {logits.shape}")
                 
-                # Calculate loss based on the loss function type
-                if args.loss_func == 'GUL' or args.loss_func == 'BEL':
-                    if weights is None:
-                        raise ValueError(f"Loss function {args.loss_func} requires 'weight' in batch but it was not found.")
-                    # For custom loss functions that take weights, pass them as keyword args
-                    try:
-                        loss = self.loss_function(logits.float(), labels.float(), weight_map=weights)
-                    except TypeError:
-                        # Fallback to standard 2-argument call if weight parameter isn't supported
-                        loss = self.loss_function(logits.float(), labels.float())
-                elif args.loss_func == 'CBEL':
-                    if weights is None:
-                        raise ValueError(f"Loss function {args.loss_func} requires 'weight' in batch but it was not found.")
-                    if lungs is None:
-                        raise ValueError(f"Loss function {args.loss_func} requires 'lung' in batch but it was not found.")
-                    # For custom loss functions that take weights and lungs, pass them as keyword args
-                    try:
-                        loss = self.loss_function(logits.float(), labels.float(), weight_map=weights, lung_mask=lungs)
-                    except TypeError:
-                        # Fallback to standard 2-argument call if parameters aren't supported
-                        loss = self.loss_function(logits.float(), labels.float())
+                # Calculate loss
+                if bg_only_batch:
+                    # Background-only supervision: penalize any false positives robustly
+                    bce_loss_fn = nn.BCEWithLogitsLoss(reduction="mean")
+                    zeros = torch.zeros_like(labels, dtype=logits.dtype)
+                    loss = bce_loss_fn(logits.float(), zeros.float())
                 else:
-                    loss = self.loss_function(logits.float(), labels.float())
+                    # Calculate loss based on the loss function type
+                    if args.loss_func == 'GUL' or args.loss_func == 'BEL':
+                        if weights is None:
+                            raise ValueError(f"Loss function {args.loss_func} requires 'weight' in batch but it was not found.")
+                        # For custom loss functions that take weights, pass them as keyword args
+                        try:
+                            loss = self.loss_function(logits.float(), labels.float(), weight_map=weights)
+                        except TypeError:
+                            # Fallback to standard 2-argument call if weight parameter isn't supported
+                            loss = self.loss_function(logits.float(), labels.float())
+                    elif args.loss_func == 'CBEL':
+                        if weights is None:
+                            raise ValueError(f"Loss function {args.loss_func} requires 'weight' in batch but it was not found.")
+                        if lungs is None:
+                            raise ValueError(f"Loss function {args.loss_func} requires 'lung' in batch but it was not found.")
+                        # For custom loss functions that take weights and lungs, pass them as keyword args
+                        try:
+                            loss = self.loss_function(logits.float(), labels.float(), weight_map=weights, lung_mask=lungs)
+                        except TypeError:
+                            # Fallback to standard 2-argument call if parameters aren't supported
+                            loss = self.loss_function(logits.float(), labels.float())
+                    else:
+                        loss = self.loss_function(logits.float(), labels.float())
             
             # Safeguard against extreme loss values that could destabilize training
             if torch.isnan(loss) or torch.isinf(loss):
@@ -1017,18 +1041,22 @@ class SegmentationNet(pl.LightningModule):
         self.val_dice_metric(y_pred=val_outputs_metric, y=val_labels.byte())
         self.val_iou_metric(y_pred=val_outputs_metric, y=val_labels.byte())
         
-        # Update airway-specific metrics with timing
-        if batch_idx < 3:  # Only show timing for first few batches to avoid spam
-            metrics_start = time.time()
-            print(f"[Batch {batch_idx}] Starting topology metrics calculation...")
-        
-        val_lungs_metric = val_lungs.byte() if val_lungs is not None else None
-        # Pass filename for better debugging of problematic samples
-        self.airway_metrics.update(pred=val_outputs_metric, target=val_labels.byte(), lungs=val_lungs_metric, filenames=[val_filename])
-        
-        if batch_idx < 3:
-            metrics_time = time.time() - metrics_start
-            print(f"[Batch {batch_idx}] Topology metrics completed in {metrics_time:.2f}s")
+        # Update airway-specific metrics with timing (optional, can be very heavy)
+        if self.enable_topology_metrics:
+            if batch_idx < 3:  # Only show timing for first few batches to avoid spam
+                metrics_start = time.time()
+                print(f"[Batch {batch_idx}] Starting topology metrics calculation...")
+            
+            val_lungs_metric = val_lungs.byte() if val_lungs is not None else None
+            # Pass filename for better debugging of problematic samples
+            self.airway_metrics.update(pred=val_outputs_metric, target=val_labels.byte(), lungs=val_lungs_metric, filenames=[val_filename])
+            
+            if batch_idx < 3:
+                metrics_time = time.time() - metrics_start
+                print(f"[Batch {batch_idx}] Topology metrics completed in {metrics_time:.2f}s")
+        else:
+            if batch_idx == 0:
+                print("Topology metrics disabled via DEBUG_TOPOLOGY_METRICS. Skipping heavy computations in validation.")
 
         # Log step loss for epoch aggregation by PyTorch Lightning
         self.log('val_loss', loss_val, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=val_inputs.size(0))
@@ -1098,19 +1126,23 @@ class SegmentationNet(pl.LightningModule):
         val_dice_loss_epoch = 1.0 - val_dice_epoch
         self.log("val_dice_loss", val_dice_loss_epoch, prog_bar=True, logger=True)
         
-        # Compute and log airway-specific metrics
-        airway_metrics = self.airway_metrics.compute()
-        self.log("val_trachea_dice", airway_metrics["trachea_dice"].item(), prog_bar=False, logger=True)
-        self.log("val_dlr", airway_metrics["dlr"].item(), prog_bar=False, logger=True)  # Detected Length Ratio
-        self.log("val_dbr", airway_metrics["dbr"].item(), prog_bar=False, logger=True)  # Detected Branch Ratio
-        self.log("val_precision", airway_metrics["precision"].item(), prog_bar=False, logger=True)
-        self.log("val_leakage", airway_metrics["leakage"].item(), prog_bar=False, logger=True)
-        self.log("val_amr", airway_metrics["amr"].item(), prog_bar=False, logger=True)  # Airway Missing Ratio
+        # Compute and log airway-specific metrics (optional)
+        if self.enable_topology_metrics:
+            airway_metrics = self.airway_metrics.compute()
+            self.log("val_trachea_dice", airway_metrics["trachea_dice"].item(), prog_bar=False, logger=True)
+            self.log("val_dlr", airway_metrics["dlr"].item(), prog_bar=False, logger=True)  # Detected Length Ratio
+            self.log("val_dbr", airway_metrics["dbr"].item(), prog_bar=False, logger=True)  # Detected Branch Ratio
+            self.log("val_precision", airway_metrics["precision"].item(), prog_bar=False, logger=True)
+            self.log("val_leakage", airway_metrics["leakage"].item(), prog_bar=False, logger=True)
+            self.log("val_amr", airway_metrics["amr"].item(), prog_bar=False, logger=True)  # Airway Missing Ratio
+            self.airway_metrics.reset()
+        else:
+            # If disabled, log zeros to keep logger keys consistent or skip entirely
+            pass
         
-        # Reset all metrics
+        # Reset other metrics
         self.val_dice_metric.reset()
         self.val_iou_metric.reset()
-        self.airway_metrics.reset()
         
         # Track best IoU, Dice, and epoch
         if hasattr(self, 'best_val_iou'): # Check if initialized
@@ -1181,7 +1213,15 @@ class SegmentationNet(pl.LightningModule):
 
         for i, (item, logit_item) in enumerate(zip(decollated_batch, decollated_logits)):
             # Combine original batch data with its corresponding prediction logit
-            item["pred"] = logit_item
+            pred_mt = MetaTensor(logit_item)
+            try:
+                if isinstance(item.get("image"), MetaTensor) and hasattr(item["image"], "meta"):
+                    pred_mt.meta = item["image"].meta.copy()
+                    if hasattr(item["image"], "affine") and item["image"].affine is not None:
+                        pred_mt.affine = item["image"].affine.clone() if hasattr(item["image"].affine, "clone") else item["image"].affine
+            except Exception:
+                pass
+            item["pred"] = pred_mt
             
             # Debug: Print shapes before inversion
             print(f"\n[DEBUG] Processing item {i}:")
@@ -1236,51 +1276,16 @@ class SegmentationNet(pl.LightningModule):
             ])
             item = preinvert_pipeline(item)
 
-            # 1b) (disabled) Pre-inversion lung masking + LCC moved to post-inversion processing
-            if False and not args.metric_testing:
-                if lung_processed is not None:
-                    # Grow the lung mask to include trachea/main bronchi that lie just outside the lung parenchyma
-                    try:
-                        import numpy as _np
-                        from scipy.ndimage import binary_dilation as _bin_dilate
-
-                        # derive ~10mm dilation in voxels
-                        if hasattr(item["pred"], "affine") and item["pred"].affine is not None:
-                            _aff = item["pred"].affine.detach().cpu().numpy() if hasattr(item["pred"].affine, "detach") else _np.array(item["pred"].affine)
-                            _spacing = _np.sqrt((_aff[:3, :3] ** 2).sum(axis=0))
-                            _vx = float(_spacing[0]) if _spacing[0] > 0 else 1.0
-                        else:
-                            _vx = 1.0
-                        _iters = max(1, int(round(10.0 / _vx)))
-
-                        _lung_np = (lung_processed > 0).cpu().numpy().squeeze().astype(bool)
-                        _lung_grown = _bin_dilate(_lung_np, iterations=_iters)
-                        _lung_grown_t = torch.from_numpy(_lung_grown).to(item["pred"].device).unsqueeze(0).to(item["pred"].dtype)
-                        item["pred"] = item["pred"] * _lung_grown_t
-
-                        if getattr(args, 'debug_inference', False):
-                            masked_np = (item["pred"] > 0.5).cpu().numpy().squeeze().astype(_np.uint8)
-                            aff_pre = item["pred"].affine.cpu().numpy() if hasattr(item["pred"], "affine") else _np.eye(4)
-                            nib.save(nib.Nifti1Image(masked_np, aff_pre), os.path.join(debug_dir, f"{base_name}_3b_binary_pre_invert_lung_masked.nii.gz"))
-                    except Exception as e:
-                        print(f"  Warning: pre-inversion lung masking failed: {e}")
-
-                # 1c) (disabled) LCC filtering in processed space; will do top-K after inversion
-                try:
-                    pass
-                except Exception as e:
-                    pass
-
             if args.metric_testing:
                 label_np = item["label"].cpu().numpy().squeeze().astype(np.uint8)
                 pred_np = item["pred"].cpu().numpy().squeeze().astype(np.uint8)
-
+                
                 # Provide a lungs mask in processed space to satisfy topology utilities
                 if "lung" in item and item["lung"] is not None:
                     lungs_np = (item["lung"].cpu().numpy().squeeze() > 0).astype(np.uint8)
                 else:
                     lungs_np = np.ones_like(label_np, dtype=np.uint8)
-
+                
                 iou, dlr, dbr, precision, leakage, amr, _, _, _, _, _, _, large_cd = evaluation_branch_metrics(
                     fid=item.get("image_meta_dict", {}).get("filename_or_obj", "unknown"),
                     label=label_np,
@@ -1323,15 +1328,106 @@ class SegmentationNet(pl.LightningModule):
                 self.test_step_outputs.append(metrics)
                 filename = os.path.basename(item.get("image_meta_dict", {}).get("filename_or_obj", f"unknown_{batch_idx}_{i}"))
                 print(f"Metrics for {filename}: {metrics}")
+                # Also save prediction volumes if requested
+                if getattr(args, 'save_val', False):
+                    # Invert to original space using the same transform chain as input
+                    invert_source_transform = self.data_module.val_transforms
+                    keys_to_invert = ["pred"]
+                    meta_keys_list = ["pred_meta_dict"]
+                    if "lung" in item and item["lung"] is not None:
+                        keys_to_invert.append("lung")
+                        meta_keys_list.append("lung_meta_dict")
+
+                    inverter = Compose([
+                        Invertd(
+                            keys=keys_to_invert,
+                            transform=invert_source_transform,
+                            orig_keys="image",
+                            meta_keys=meta_keys_list,
+                            orig_meta_keys="image_meta_dict",
+                            meta_key_postfix="meta_dict",
+                            nearest_interp=True,
+                            to_tensor=True,
+                        )
+                    ])
+                    save_item = inverter(dict(item))
+                    # Ensure binary after inversion
+                    save_item = Compose([AsDiscreted(keys="pred", threshold=0.5)])(save_item)
+
+                    # Apply post-inversion lung masking and LCC (mirror off_val logic)
+                    try:
+                        import numpy as _np
+                        from scipy.ndimage import binary_dilation as _bin_dilate
+
+                        pred_np = (save_item["pred"].cpu().numpy().squeeze() > 0.5).astype(_np.uint8)
+                        initial_pred_count = int(_np.sum(pred_np > 0))
+
+                        lung_np = None
+                        if "lung" in save_item and save_item["lung"] is not None:
+                            lung_np = (save_item["lung"].cpu().numpy().squeeze() > 0).astype(_np.uint8)
+                            if lung_np.shape != pred_np.shape:
+                                lung_np = None
+
+                        if lung_np is not None and float(_np.sum(lung_np > 0)) > 0.05 * float(_np.prod(lung_np.shape)):
+                            _vx = 1.0
+                            if hasattr(save_item["pred"], "affine") and save_item["pred"].affine is not None:
+                                _aff = save_item["pred"].affine
+                                if hasattr(_aff, "detach"):
+                                    _aff = _aff.detach().cpu().numpy()
+                                else:
+                                    _aff = _np.array(_aff)
+                                _spacing = _np.sqrt((_aff[:3, :3] ** 2).sum(axis=0)).astype(float)
+                                x_sp = float(_spacing[0]) if _spacing.size >= 1 else 1.0
+                                if not _np.isfinite(x_sp) or x_sp <= 0.0:
+                                    try:
+                                        x_sp = float(_np.mean(_spacing))
+                                    except Exception:
+                                        x_sp = 1.0
+                                _vx = x_sp
+                                _iters = int(max(1, round(10.0 / float(_vx))))
+                                lung_dilated = _bin_dilate(lung_np > 0, iterations=_iters)
+
+                            test_masked = pred_np * lung_dilated.astype(_np.uint8)
+                            masked_count = int(_np.sum(test_masked > 0))
+                            removal_ratio = (initial_pred_count - masked_count) / float(max(initial_pred_count, 1))
+                            if float(removal_ratio) < 0.5:
+                                pred_np = test_masked
+
+                        if pred_np.any():
+                            pred_np = get_lcc(pred_np)
+                        pred_topk_t = torch.from_numpy(pred_np).to(save_item["pred"].device).unsqueeze(0).to(save_item["pred"].dtype)
+                        save_item["pred"] = pred_topk_t
+                    except Exception as _e:
+                        print(f"  Warning: post-inversion processing during metric-saving failed: {_e}")
+
+                    # Drop lung before saving (already applied)
+                    if "lung" in save_item:
+                        save_item.pop("lung")
+
+                    saver = SaveImageWithOriginalMetadatad(
+                        keys="pred",
+                        output_dir=os.path.join(output_path, "preds"),
+                        output_postfix="seg",
+                        separate_folder=True,
+                        print_log=True,
+                        resample_full_volume=False,
+                    )
+                    saver(save_item)
                 continue
             # 2) Invert only the prediction back to original space
             invert_source_transform = self.data_module.val_transforms if args.metric_testing else self.data_module.test_transforms
+            keys_to_invert = ["pred"]
+            meta_keys_list = ["pred_meta_dict"]
+            if "lung" in item and item["lung"] is not None:
+                keys_to_invert.append("lung")
+                meta_keys_list.append("lung_meta_dict")
+
             inverter = Compose([
                 Invertd(
-                    keys=["pred"],
+                    keys=keys_to_invert,
                     transform=invert_source_transform,
                     orig_keys="image",
-                    meta_keys=["pred_meta_dict"],
+                    meta_keys=meta_keys_list,
                     orig_meta_keys="image_meta_dict",
                     meta_key_postfix="meta_dict",
                     nearest_interp=True,
@@ -1345,82 +1441,104 @@ class SegmentationNet(pl.LightningModule):
                 AsDiscreted(keys="pred", threshold=0.5),
             ])
             processed_item = postinvert_pipeline(processed_item)
-            
+
             # 2b) Post-inversion lung masking and top-K component retention for inference
             if not args.metric_testing:
                 try:
                     import numpy as _np
                     from scipy.ndimage import binary_dilation as _bin_dilate
-                    from scipy.ndimage import label as _nd_label
 
-                    # Load original-space lung mask if available
-                    lung_np = None
-                    filename = item.get("image_meta_dict", {}).get("filename_or_obj", "")
-                    if filename:
-                        if isinstance(filename, list):
-                            filename = filename[0]
-                        filename_str = str(filename)
-                        lung_path = None
-                        if 'val/' in filename_str:
-                            lung_path = filename_str.replace('val/', 'val_lungs/').replace('.npy', '.nii.gz')
-                        elif 'imagesTr/' in filename_str:
-                            lung_path = filename_str.replace('imagesTr/', 'lungsTr/').replace('.npy', '.nii.gz')
-                        if lung_path and os.path.exists(lung_path):
-                            try:
-                                lung_nifti = nib.load(lung_path)
-                                lung_np = lung_nifti.get_fdata().astype(_np.uint8)
-                                lung_np = _np.transpose(lung_np, (2, 1, 0))
-                            except Exception as e:
-                                lung_np = None
-                    
                     pred_np = (processed_item["pred"].cpu().numpy().squeeze() > 0.5).astype(_np.uint8)
 
-                    # Dilate lung mask by ~15 mm in original spacing if available
-                    if lung_np is not None:
-                        # Estimate voxel spacing from pred affine if present; fall back to 1.0
-                        if hasattr(processed_item["pred"], "affine") and processed_item["pred"].affine is not None:
-                            _aff = processed_item["pred"].affine.detach().cpu().numpy() if hasattr(processed_item["pred"].affine, "detach") else _np.array(processed_item["pred"].affine)
-                            _spacing = _np.sqrt((_aff[:3, :3] ** 2).sum(axis=0))
-                            _vx = float(_spacing[0]) if _spacing[0] > 0 else 1.0
-                        else:
+                    # DEBUG: Count initial voxels
+                    initial_pred_count = int(_np.sum(pred_np > 0))
+                    print(f"  Initial prediction voxels: {initial_pred_count:,}")
+
+                    # Use inverted lung from pipeline if available
+                    lung_np = None
+                    if "lung" in processed_item and processed_item["lung"] is not None:
+                        lung_np = (processed_item["lung"].cpu().numpy().squeeze() > 0).astype(_np.uint8)
+
+                        # DEBUG: Check lung mask coverage
+                        lung_coverage = float(_np.sum(lung_np > 0)) / float(_np.prod(lung_np.shape))
+                        print(f"  Lung mask coverage: {lung_coverage:.1%}")
+
+                        # Verify lung mask and prediction are in same coordinate system
+                        if lung_np.shape != pred_np.shape:
+                            print(f"  WARNING: Lung shape {lung_np.shape} != pred shape {pred_np.shape}")
+                            lung_np = None
+
+                    # Apply conservative lung masking only if lung mask looks reasonable
+                    if lung_np is not None and float(_np.sum(lung_np > 0)) > 0.05 * float(_np.prod(lung_np.shape)):
+                        try:
+                            # Get voxel spacing for dilation
                             _vx = 1.0
-                        _iters = max(1, int(round(15.0 / _vx)))
+                            if hasattr(processed_item["pred"], "affine") and processed_item["pred"].affine is not None:
+                                _aff = processed_item["pred"].affine
+                                if hasattr(_aff, "detach"):
+                                    _aff = _aff.detach().cpu().numpy()
+                                else:
+                                    _aff = _np.array(_aff)
+                                _spacing = _np.sqrt((_aff[:3, :3] ** 2).sum(axis=0)).astype(float)  # vector of 3
+                                # Safely pick a scalar spacing (prefer X; fall back to mean)
+                                x_sp = float(_spacing[0]) if _spacing.size >= 1 else 1.0
+                                if not _np.isfinite(x_sp) or x_sp <= 0.0:
+                                    try:
+                                        x_sp = float(_np.mean(_spacing))
+                                    except Exception:
+                                        x_sp = 1.0
+                                _vx = x_sp
+                                # Conservative dilation
+                                _iters = int(max(1, round(10.0 / float(_vx))))
+                                lung_dilated = _bin_dilate(lung_np > 0, iterations=_iters)
 
-                        lung_dilated = _bin_dilate(lung_np > 0, iterations=_iters)
-                        pred_np = pred_np * lung_dilated.astype(_np.uint8)
+                            # Test masking impact before applying
+                            test_masked = pred_np * lung_dilated.astype(_np.uint8)
+                            masked_count = int(_np.sum(test_masked > 0))
+                            removal_ratio = (initial_pred_count - masked_count) / float(max(initial_pred_count, 1))
+                            print(f"  Lung masking would remove {removal_ratio:.1%} of prediction")
 
-                    # Keep top-K connected components by size (K=3)
+                            # Only apply lung masking if it doesn't remove too much
+                            if float(removal_ratio) < 0.5:
+                                pred_np = test_masked
+                                print(f"  Applied lung masking (removed {removal_ratio:.1%})")
+                            else:
+                                print(f"  SKIPPED lung masking - would remove too much ({removal_ratio:.1%})")
+
+                        except Exception as e:
+                            print(f"  Lung masking failed: {e}, proceeding without lung mask")
+                    else:
+                        print("  Skipping lung masking - insufficient lung coverage")
+
+                    # Apply LCC only if there are remaining voxels
                     if pred_np.any():
-                        structure = _np.ones((3,3,3), dtype=_np.uint8)
-                        labeled, num = _nd_label(pred_np, structure=structure)
-                        if num > 1:
-                            # Compute component sizes
-                            sizes = _np.bincount(labeled.ravel())
-                            sizes[0] = 0  # ignore background
-                            K = 3
-                            topk_idx = _np.argsort(sizes)[-K:]
-                            topk_mask = _np.isin(labeled, topk_idx).astype(_np.uint8)
-                            pred_np = topk_mask
+                        pred_np = get_lcc(pred_np)
+                        final_count = int(_np.sum(pred_np > 0))
+                        print(f"  Final voxels after LCC: {final_count:,}")
 
-                    # Write back to tensor
+                    # Convert back to tensor
                     pred_topk_t = torch.from_numpy(pred_np).to(processed_item["pred"].device).unsqueeze(0).to(processed_item["pred"].dtype)
                     processed_item["pred"] = pred_topk_t
 
+                    # Optional debug saving
                     if getattr(args, 'debug_inference', False):
-                        aff_post = processed_item["pred"].affine.cpu().numpy() if hasattr(processed_item["pred"], "affine") else _np.eye(4)
-                        nib.save(nib.Nifti1Image(pred_np.astype(_np.uint8), aff_post), os.path.join(debug_dir, f"{base_name}_4_post_invert_topk.nii.gz"))
+                        try:
+                            import nibabel as _nib
+                            aff_post = processed_item["pred"].affine.cpu().numpy() if hasattr(processed_item["pred"], "affine") else _np.eye(4)
+                            _nib.save(_nib.Nifti1Image(pred_np.astype(_np.uint8), aff_post), os.path.join(debug_dir, f"{base_name}_4_post_invert_topk.nii.gz"))
+                        except Exception as e:
+                            print(f"  Debug save failed: {e}")
+
                 except Exception as e:
-                    print(f"  Warning: post-inversion top-K/lung masking failed: {e}")
-            
+                    print(f"  Warning: post-inversion processing failed: {e}")
+            else:
+                print("Metric testing mode detected. Skipping post-inversion processing.")
+
             # Debug: Print shapes after inversion
             print(f"  Prediction shape after inversion: {processed_item['pred'].shape}")
             pred_voxels = torch.sum(processed_item['pred'] > 0).item()
             print(f"  Non-zero prediction voxels after inversion: {pred_voxels}")
             
-            # Metrics path
-            # Note: metric testing is handled earlier in processed space and continues to next item.
-            # This block is intentionally removed to avoid duplicated logic.
-
             # In inference mode, save the final prediction
             # Remove lung to avoid a second masking at save-time (already masked post-inversion)
             if "lung" in processed_item:
@@ -1432,7 +1550,7 @@ class SegmentationNet(pl.LightningModule):
                 output_postfix="seg",
                 separate_folder=True,
                 print_log=True,
-                skip_resample=True,
+                resample_full_volume=False,
             )
             saver(processed_item)
 
@@ -1532,8 +1650,8 @@ class SegmentationNet(pl.LightningModule):
                     roi_size=roi_size,
                     sw_batch_size=1,
                     predictor=self.forward,
-                    overlap=0.25,
-                    mode="constant",
+                    overlap=0.5,
+                    mode="gaussian",
                     device=self._device,
                     progress=True,
                 ).cpu()
@@ -1740,7 +1858,7 @@ if __name__ == '__main__':
                 check_val_every_n_epoch=1, 
                 enable_progress_bar=True,
                 sync_batchnorm=False, 
-                callbacks=trainer_callbacks, 
+                callbacks=trainer_callbacks,
             )
             print("\n==== GPU INFORMATION BEFORE TRAINING ====")
             monitor_gpu_usage()   
@@ -1754,6 +1872,23 @@ if __name__ == '__main__':
                 else:
                     print(f"Warning: Checkpoint path {args.resume_from_checkpoint} does not exist. Starting fresh training.")
             
+            # Optional weights-only fine-tune (do NOT resume optimizer/scheduler)
+            if not ckpt_path and args.finetune_from:
+                if os.path.exists(args.finetune_from):
+                    try:
+                        checkpoint = torch.load(args.finetune_from, map_location=device)
+                        state_dict = checkpoint.get("state_dict", checkpoint)
+                        missing, unexpected = net.load_state_dict(state_dict, strict=False)
+                        print(f"Loaded weights from {args.finetune_from} (weights-only). Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+                        if len(missing) > 0:
+                            print(f"First few missing keys: {missing[:10]}")
+                        if len(unexpected) > 0:
+                            print(f"First few unexpected keys: {unexpected[:10]}")
+                    except Exception as e:
+                        print(f"Failed to load weights from {args.finetune_from}: {e}")
+                else:
+                    print(f"Warning: --finetune_from path not found: {args.finetune_from}")
+
             trainer.fit(net, datamodule=data_module, ckpt_path=ckpt_path)
             print(f"train completed, best_metric: {net.best_val_dice:.4f} Dice and {net.best_val_iou:.4f} IoU " f"at epoch {net.best_val_epoch}")
             # Print summary after training
@@ -1858,7 +1993,7 @@ if __name__ == '__main__':
                 gradient_clip_val=1.0,
                 precision='16-mixed' if args.mixed else '32-true',
                 enable_model_summary=True,
-                num_sanity_val_steps=0,
+                num_sanity_val_steps=1,
             )
             net.load_state_dict(torch.load(best_model_path)["state_dict"])
             # net.load_from_checkpoint(checkpoint_path=best_model_path)

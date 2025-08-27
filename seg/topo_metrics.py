@@ -48,6 +48,7 @@ def compute_binary_iou(y_true, y_pred, lungs=None, masked=False):
     union = int(np.logical_or(yt, yp).sum())
     return float(intersection) / float(union) if union > 0 else 0.0
 
+
 def evaluation_branch_metrics(fid, label, pred, lungs=None, refine=False):
     """
     :return: iou, dice, detected length ratio, detected branch ratio,
@@ -62,7 +63,20 @@ def evaluation_branch_metrics(fid, label, pred, lungs=None, refine=False):
     parsing_gt = get_parsing(label, refine)
 
     cd, num = measure.label(pred, return_num=True, connectivity=1)
+    # --- Debug: report number of components ---
+    if DEBUG_TOPOLOGY_METRICS != 'none':
+        try:
+            _fid_str = os.path.basename(fid) if isinstance(fid, (str, bytes)) else str(fid)
+        except Exception:
+            _fid_str = str(fid)
+        print(f"DEBUG eval_metrics[{_fid_str}]: Found {num} connected components in prediction.")
+        if num > MAX_COMPONENTS_THRESHOLD:
+            print(f"WARNING: Found {num} connected components (>{MAX_COMPONENTS_THRESHOLD}). This may indicate very noisy predictions.")
+
     if num < 1:
+        if DEBUG_TOPOLOGY_METRICS in ('minimal', 'detailed', 'full'):
+            elapsed = time.time() - start_time
+            print(f"DEBUG eval_metrics: No components found. Elapsed {elapsed:.3f}s")
         return 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, None
 
     # Select among top-K largest components if needed (template behavior)
@@ -70,21 +84,67 @@ def evaluation_branch_metrics(fid, label, pred, lungs=None, refine=False):
     for k in range(num):
         volume[k] = ((cd == (k + 1)).astype(np.uint8)).sum()
     order = np.argsort(volume)[::-1]
-    #large_cd is the largest connected component
+
+    # Pre-compute IoU for top components for debug display
+    debug_top_list = []
+    if DEBUG_TOPOLOGY_METRICS in ('detailed', 'minimal'):
+        top_k_dbg = min(MAX_DEBUG_COMPONENTS, num)
+        for idx in order[:top_k_dbg]:
+            lab = idx + 1
+            candidate = (cd == lab).astype(np.uint8)
+            iou_cand = compute_binary_iou(label, candidate)
+            debug_top_list.append((lab, int(volume[idx]), float(iou_cand)))
+    elif DEBUG_TOPOLOGY_METRICS == 'full':
+        # Expensive: compute for all components and list them in descending volume
+        for idx in order:
+            lab = idx + 1
+            candidate = (cd == lab).astype(np.uint8)
+            iou_cand = compute_binary_iou(label, candidate)
+            debug_top_list.append((lab, int(volume[idx]), float(iou_cand)))
+
+    #large_cd is the largest connected component (selected by IoU heuristic)
     large_cd = None
     iou = 0.0
+    selected_lab = None
+    selected_vol = 0
+
     K = min(5, num)
     for idx in order[:K]:
         candidate = (cd == (idx + 1)).astype(np.uint8)
         iou_candidate = compute_binary_iou(label, candidate)
-        if iou_candidate >= 0.1:
+        if iou_candidate >= 0.1 and (large_cd is None or iou_candidate > iou):
             large_cd = candidate
             iou = iou_candidate
-            break
-        # keep best attempt to report if all are < 0.1
-        if iou_candidate > iou:
-            iou = iou_candidate
-            large_cd = candidate
+            selected_lab = idx + 1
+            selected_vol = int(volume[idx])
+            # choose first good component meeting threshold; continue to check if any with higher IoU in top-K
+    # If none met threshold, keep the best among top-K
+    if large_cd is None:
+        best_idx = None
+        best_iou = -1.0
+        for idx in order[:K]:
+            candidate = (cd == (idx + 1)).astype(np.uint8)
+            iou_candidate = compute_binary_iou(label, candidate)
+            if iou_candidate > best_iou:
+                best_iou = iou_candidate
+                best_idx = idx
+                large_cd = candidate
+                iou = iou_candidate
+                selected_lab = idx + 1
+                selected_vol = int(volume[idx])
+
+    # Debug: print selection summary and top components table if requested
+    if DEBUG_TOPOLOGY_METRICS == 'minimal':
+        elapsed = time.time() - start_time
+        print(f"DEBUG eval_metrics: Selected label={selected_lab} with IoU={iou:.4f}, volume={selected_vol}. Elapsed {elapsed:.3f}s")
+    elif DEBUG_TOPOLOGY_METRICS in ('detailed', 'full'):
+        print(f"DEBUG eval_metrics: Top {len(debug_top_list)} components by volume:")
+        # debug_top_list already sorted by volume desc due to 'order'
+        for lab, vol, iou_cand in debug_top_list:
+            sel_mark = " ✓ SELECTED" if lab == selected_lab else ""
+            print(f"  - label={lab}: volume={vol}, IoU={iou_cand:.4f}{sel_mark}")
+        elapsed = time.time() - start_time
+        print(f"DEBUG eval_metrics: Selected component label={selected_lab} with IoU={iou:.4f} (volume={selected_vol}), analysis completed in {elapsed:.3f}s")
 
     if large_cd is None:
         # Should not happen, but guard anyway
