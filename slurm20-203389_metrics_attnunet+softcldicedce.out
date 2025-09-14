@@ -1,0 +1,1213 @@
+------------------------------------------------------------
+SLURM JOB ID: 203389
+Running on host: gpuvm14.doc.ic.ac.uk
+Working directory: /vol/bitbucket/ss2424/project/seg_template
+------------------------------------------------------------
+CUDA version: V12.2.91
+Changed directory to: /vol/bitbucket/ss2424/project/seg_template
+Activating venv: source project/bin/activate
+Python executable: /vol/bitbucket/ss2424/project/seg_template/project/bin/python
+Python version: Python 3.12.3
+Loading minimal CUDA runtime for PyTorch
+CUDA LOADED
+Running nvidia-smi:
+Sat Sep 13 12:33:31 2025       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 570.133.07             Driver Version: 570.133.07     CUDA Version: 12.8     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  Tesla T4                       Off |   00000000:00:07.0 Off |                    0 |
+| N/A   34C    P8             11W /   70W |       0MiB /  15360MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+------------------------------------------------------------
+Executing testing script with the following configuration:
+  - Experiment Path: DiceCEPlusSoftclDice_ATM22_9_11_0_AttentionUNet_prtrFalse_AdamW_128_b1_p4_0.0001_alpha0.3_r_d1.0r_l0.7WarmupCosineSchedule
+  - Weights File:    best_metric_model_45-0.7512.ckpt
+------------------------------------------------------------
+Executing testing script to generate predictions for the official validation set...
+[rank: 0] Seed set to 42
+Using 16bit Automatic Mixed Precision (AMP)
+You are using the plain ModelCheckpoint callback. Consider using LitModelCheckpoint which with seamless uploading to Model registry.
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+HPU available: False, using: 0 HPUs
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+SLURM auto-requeueing enabled. Setting signal handlers.
+/vol/bitbucket/ss2424/project/seg_template/project/lib/python3.12/site-packages/pytorch_lightning/trainer/connectors/data_connector.py:425: The 'test_dataloader' does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=5` in the `DataLoader` to improve performance.
+Utils: Using deterministic algorithms with fallback for CUDA compatibility
+Set multiprocessing start method to 'spawn'
+Using deterministic algorithms with fallback for non-deterministic CUDA operations
+cache_dataset parameter value: False
+max_time_hours: 0
+patch_size: 128
+test_patch_size: 128
+debug_inference: False
+one_hot: False
+mixed: True
+pixel_value_min: -1000.0
+pixel_value_max: 600.0
+pixel_norm_min: 0.0
+pixel_norm_max: 1.0
+model_name: AttentionUNet
+spatial_dims: 3
+in_channels: 1
+out_channels: 1
+n_layers: 4
+channels: 16
+strides: 2
+num_res_units: 2
+dropout: 0.2
+norm: INSTANCE
+loss_func: DiceCEPlusSoftclDice
+alpha: 0.3
+r_d: 1.0
+r_l: 0.7
+scheduler: WarmupCosineSchedule
+patience: 4
+optimizer: AdamW
+lr: 0.0001
+max_epochs: 100
+max_cardinality: 200
+batch_size: 1
+num_workers: 0
+prefetch_factor: 1
+gradient_checkpointing: True
+smartcache: False
+cache_rate: 0.4
+smartcache_replace_rate: 0.25
+smartcache_init_workers_factor: 0.5
+smartcache_replace_workers_factor: 0.5
+exp_path: DiceCEPlusSoftclDice_ATM22_9_11_0_AttentionUNet_prtrFalse_AdamW_128_b1_p4_0.0001_alpha0.3_r_d1.0r_l0.7WarmupCosineSchedule
+weights_path: best_metric_model_45-0.7512.ckpt
+dataset: ATM22
+weights_dir: Wr1alpha0.2
+awc: False
+awc_factor: 1.2
+amp: False
+cache_dataset: False
+save_val: False
+print_val_stats: False
+pred_threshold: 0.5
+training: False
+validation: False
+testing: False
+metric_testing: True
+test_dataset: val
+awc_val: False
+resume_from_checkpoint: 
+finetune_from: 
+use_pretrained: True
+The output path is ./outputs/DiceCEPlusSoftclDice_ATM22_9_11_0_AttentionUNet_prtrFalse_AdamW_128_b1_p4_0.0001_alpha0.3_r_d1.0r_l0.7WarmupCosineSchedule
+The dataset root path for DataModule will be: ./ATM22/npy_files/
+parameters...
+PATCH_SIZE = (128, 128, 128)
+BATCH_SIZE = 1
+MAX_CARDINALITY = 200
+NUM_WORKERS = 0
+PREFETCH_FACTOR = 1
+PIN_MEMORY = False
+PIXEL_VALUE_MIN = -1000
+PIXEL_VALUE_MAX = 600
+PIXEL_NORM_MIN = 0.0
+PIXEL_NORM_MAX = 1.0
+NUM_EPOCHS = 100
+CACHE_DATASET = False
+SMARTCACHE = False
+SMARTCACHE_REPLACE_RATE = 0.25
+SMARTCACHE_INIT_WORKERS_FACTOR = 0.5
+SMARTCACHE_REPLACE_WORKERS_FACTOR = 0.5
+CACHE_RATE = 0.4
+PERSISTENT_DATASET = False
+AVAILABLE_GPUs = 1
+DEVICE_NO = 0
+VALIDATION_PHASE = False
+TRAINING_PHASE = False
+TEST_PHASE = True
+USE_PRETRAINED = True
+WEIGHT_DIR = Wr1alpha0.2
+ONE_HOT = False
+IN_CHANNELS = 1
+OUT_CHANNELS = 1
+PRECOMPUTE_SKELETONS = False
+SKEL_DIR = None
+REGIONS_DIR = None
+MODEL_NAME = AttentionUNet
+CROP_BY_ANAT_STRUCTURES = False
+TRACHEA_PROB = 0.15
+BRANCH_PROB = 0.55
+DISTAL_PROB = 0.3
+CROP_DEBUG_SAVE = False
+OUTPUT_PATH = ./outputs/
+CROP_FAST_MODE = True
+MIN_BRANCH_CLUSTER_SIZE = 1
+MIN_DISTAL_COMPONENT_SIZE = 1
+MAX_CACHE_MEMORY_MB = 15000
+FORCE_CACHE_NUM = 0
+TEST_DATASET = val
+USE_PATCH_BANK_SAMPLING = True
+PATCH_BANKS_DIR = ./ATM22/npy_files/patch_banks
+SAMPLER_POS_RATIO = 0.9
+SAMPLER_TEMPERATURE = 0.7
+SAMPLER_FG_THRESHOLD = 4.76837158203125e-05
+SAMPLER_USE_LANDMARKS = True
+SAMPLER_QUOTA_BIFURCATION = 0.1
+SAMPLER_QUOTA_TRACHEA = 0.05
+use_persistent_dataset: False
+Patch size: (128, 128, 128)
+=== CUDA is available ===
+CUDA initialized successfully.
+Device 0: Tesla T4
+Creating model: AttentionUNet
+Created AttentionUNet with channels=[16, 32, 64, 128], strides=[2, 2, 2, 2]
+Model created with 1,466,549 trainable parameters
+Enabling gradient checkpointing for memory optimization...
+Applied Kaiming initialization to model weights
+use_persistent_dataset: False
+Patch size: (128, 128, 128)
+WARNING: SmartCacheCallback not used because caching is disabled
+=== STARTING TESTING PHASE ===
+Creating model: AttentionUNet
+Created AttentionUNet with channels=[16, 32, 64, 128], strides=[2, 2, 2, 2]
+Model created with 1,466,549 trainable parameters
+Enabling gradient checkpointing for memory optimization...
+Using checkpoint resolved under model dir: ./outputs/DiceCEPlusSoftclDice_ATM22_9_11_0_AttentionUNet_prtrFalse_AdamW_128_b1_p4_0.0001_alpha0.3_r_d1.0r_l0.7WarmupCosineSchedule/model/best_metric_model_45-0.7512.ckpt
+Model loaded successfully!
+Setting up datamodule for 'test' stage (using official validation data)...
+Setting up data module for stage: test...
+val_size value 44
+Dataset split - Train: 255, Val: 44, Off-val: 50, Test: 50
+use_patch_bank_sampling: True
+patch_banks_dir: ./ATM22/npy_files/patch_banks
+sampler_pos_ratio: 0.9
+sampler_temperature: 0.7
+sampler_fg_threshold: 4.76837158203125e-05
+Applying SamplePatchFromBankd, using patch-bank
+use_patch_bank_sampling: True
+patch_banks_dir: ./ATM22/npy_files/patch_banks
+sampler_pos_ratio: 0.9
+sampler_temperature: 0.7
+sampler_fg_threshold: 4.76837158203125e-05
+Data module setup complete.
+Validation dataset size: 44
+Data module already set up. Skipping.
+Metric testing enabled: using validation split (with labels) for the 'test' stage.
+Testing: |          | 0/? [00:00<?, ?it/s]Testing:   0%|          | 0/44 [00:00<?, ?it/s]Testing DataLoader 0:   0%|          | 0/44 [00:00<?, ?it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 499, 203, 373])
+  Image shape: torch.Size([1, 499, 203, 373])
+  Lung shape: torch.Size([1, 499, 203, 373])
+DEBUG eval_metrics[ATM_614_0000.npy]: Found 238 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=194: volume=105827, IoU=0.8493SELECTED
+  - label=1: volume=3596, IoU=0.0000
+  - label=227: volume=307, IoU=0.0015
+  - label=226: volume=292, IoU=0.0009
+  - label=216: volume=209, IoU=0.0014
+  - label=197: volume=185, IoU=0.0008
+  - label=201: volume=160, IoU=0.0006
+  - label=215: volume=93, IoU=0.0005
+  - label=203: volume=85, IoU=0.0003
+  - label=228: volume=79, IoU=0.0000
+DEBUG eval_metrics: Selected component label=194 with IoU=0.8493 (volume=105827), analysis completed in 43.974s
+DEBUG eval_metrics: num_branch=196, median_branch_len=12.0
+DEBUG eval_metrics: DLR=0.8785, DBR=0.8929 (detected 175/196 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_614_0000.npy: {'iou_full': 0.8184552513281569, 'dice_full': 0.9001654021789939, 'iou_lcc': 0.8493243185489731, 'dice_lcc': 0.9189985816782397, 'iou': 0.8184552513281569, 'dice': 0.9001654021789939, 'dlr': 0.8784834737524303, 'dbr': 0.8928571428571429, 'precision': 0.9389928437907139, 'leakage': 0.05846323655806968, 'amr': 0.10016194551754712}
+Testing DataLoader 0:   2%|▏         | 1/44 [00:54<39:09,  0.02it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 522, 253, 410])
+  Image shape: torch.Size([1, 522, 253, 410])
+  Lung shape: torch.Size([1, 522, 253, 410])
+DEBUG eval_metrics[ATM_615_0000.npy]: Found 133 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=43: volume=171341, IoU=0.8496SELECTED
+  - label=28: volume=5858, IoU=0.0000
+  - label=9: volume=5497, IoU=0.0000
+  - label=37: volume=2924, IoU=0.0000
+  - label=1: volume=1742, IoU=0.0000
+  - label=7: volume=1548, IoU=0.0000
+  - label=6: volume=965, IoU=0.0000
+  - label=68: volume=794, IoU=0.0033
+  - label=27: volume=431, IoU=0.0000
+  - label=53: volume=271, IoU=0.0003
+DEBUG eval_metrics: Selected component label=43 with IoU=0.8496 (volume=171341), analysis completed in 62.181s
+DEBUG eval_metrics: num_branch=304, median_branch_len=12.0
+DEBUG eval_metrics: DLR=0.9142, DBR=0.8980 (detected 273/304 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_615_0000.npy: {'iou_full': 0.7647455809924041, 'dice_full': 0.8666921614415939, 'iou_lcc': 0.8496239391435898, 'dice_lcc': 0.9196610719584569, 'iou': 0.7647455809924041, 'dice': 0.8666921614415939, 'dlr': 0.9142207523770153, 'dbr': 0.8980263157894737, 'precision': 0.9244616890380313, 'leakage': 0.07475784132841329, 'amr': 0.0850899446494465}
+Testing DataLoader 0:   5%|▍         | 2/44 [02:18<48:31,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 516, 270, 440])
+  Image shape: torch.Size([1, 516, 270, 440])
+  Lung shape: torch.Size([1, 516, 270, 440])
+DEBUG eval_metrics[ATM_623_0000.npy]: Found 399 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=183: volume=162945, IoU=0.7845SELECTED
+  - label=199: volume=758, IoU=0.0000
+  - label=189: volume=574, IoU=0.0020
+  - label=36: volume=556, IoU=0.0000
+  - label=285: volume=538, IoU=0.0023
+  - label=218: volume=372, IoU=0.0014
+  - label=192: volume=351, IoU=0.0012
+  - label=287: volume=344, IoU=0.0014
+  - label=281: volume=277, IoU=0.0012
+  - label=195: volume=271, IoU=0.0009
+DEBUG eval_metrics: Selected component label=183 with IoU=0.7845 (volume=162945), analysis completed in 99.234s
+DEBUG eval_metrics: num_branch=297, median_branch_len=14.0
+DEBUG eval_metrics: DLR=0.7737, DBR=0.7677 (detected 228/297 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_623_0000.npy: {'iou_full': 0.7738587071324357, 'dice_full': 0.8725144838434526, 'iou_lcc': 0.7844726266789158, 'dice_lcc': 0.8808751141565625, 'iou': 0.7738587071324357, 'dice': 0.8725144838434526, 'dlr': 0.7737269665147612, 'dbr': 0.7676767676767676, 'precision': 0.938235276124288, 'leakage': 0.054647707405262334, 'amr': 0.16987555954900485}
+Testing DataLoader 0:   7%|▋         | 3/44 [04:21<59:34,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 502, 270, 398])
+  Image shape: torch.Size([1, 502, 270, 398])
+  Lung shape: torch.Size([1, 502, 270, 398])
+DEBUG eval_metrics[ATM_626_0000.npy]: Found 1815 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=1692: volume=145144, IoU=0.7958SELECTED
+  - label=1758: volume=969, IoU=0.0052
+  - label=1812: volume=872, IoU=0.0000
+  - label=1685: volume=762, IoU=0.0033
+  - label=1749: volume=733, IoU=0.0040
+  - label=49: volume=641, IoU=0.0000
+  - label=1625: volume=556, IoU=0.0023
+  - label=1727: volume=380, IoU=0.0014
+  - label=1786: volume=348, IoU=0.0018
+  - label=226: volume=337, IoU=0.0000
+DEBUG eval_metrics: Selected component label=1692 with IoU=0.7958 (volume=145144), analysis completed in 226.500s
+DEBUG eval_metrics: num_branch=200, median_branch_len=13.0
+DEBUG eval_metrics: DLR=0.7575, DBR=0.7300 (detected 146/200 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_626_0000.npy: {'iou_full': 0.7805848810064021, 'dice_full': 0.8767735695534028, 'iou_lcc': 0.7957985895757241, 'dice_lcc': 0.8885889077174943, 'iou': 0.7805848810064021, 'dice': 0.8767735695534028, 'dlr': 0.7575100650356147, 'dbr': 0.73, 'precision': 0.9549354898450522, 'leakage': 0.039209367278977336, 'amr': 0.1691373939198625}
+Testing DataLoader 0:   9%|▉         | 4/44 [08:30<1:25:00,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 474, 218, 366])
+  Image shape: torch.Size([1, 474, 218, 366])
+  Lung shape: torch.Size([1, 474, 218, 366])
+DEBUG eval_metrics[ATM_627_0000.npy]: Found 1214 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=1153: volume=79901, IoU=0.8171SELECTED
+  - label=22: volume=14396, IoU=0.0000
+  - label=1214: volume=2555, IoU=0.0000
+  - label=28: volume=1797, IoU=0.0000
+  - label=880: volume=1087, IoU=0.0000
+  - label=1156: volume=1005, IoU=0.0073
+  - label=1208: volume=337, IoU=0.0017
+  - label=1154: volume=132, IoU=0.0008
+  - label=1204: volume=127, IoU=0.0006
+  - label=31: volume=124, IoU=0.0000
+DEBUG eval_metrics: Selected component label=1153 with IoU=0.8171 (volume=79901), analysis completed in 112.083s
+DEBUG eval_metrics: num_branch=189, median_branch_len=13.0
+DEBUG eval_metrics: DLR=0.8431, DBR=0.8201 (detected 155/189 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_627_0000.npy: {'iou_full': 0.6521393434745, 'dice_full': 0.7894483550074304, 'iou_lcc': 0.8171172072042043, 'dice_lcc': 0.8993824518495873, 'iou': 0.6521393434745, 'dice': 0.7894483550074304, 'dlr': 0.8430976430976431, 'dbr': 0.8201058201058201, 'precision': 0.9204305112320881, 'leakage': 0.07601171618148125, 'amr': 0.120724490405882}
+Testing DataLoader 0:  11%|█▏        | 5/44 [10:38<1:22:57,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 507, 269, 411])
+  Image shape: torch.Size([1, 507, 269, 411])
+  Lung shape: torch.Size([1, 507, 269, 411])
+DEBUG eval_metrics[ATM_628_0000.npy]: Found 150 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=50: volume=123331, IoU=0.8318SELECTED
+  - label=106: volume=823, IoU=0.0048
+  - label=87: volume=573, IoU=0.0031
+  - label=95: volume=379, IoU=0.0018
+  - label=53: volume=338, IoU=0.0016
+  - label=55: volume=331, IoU=0.0014
+  - label=64: volume=268, IoU=0.0013
+  - label=62: volume=258, IoU=0.0011
+  - label=138: volume=240, IoU=0.0015
+  - label=113: volume=231, IoU=0.0010
+DEBUG eval_metrics: Selected component label=50 with IoU=0.8318 (volume=123331), analysis completed in 56.576s
+DEBUG eval_metrics: num_branch=196, median_branch_len=16.5
+DEBUG eval_metrics: DLR=0.8197, DBR=0.8265 (detected 162/196 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_628_0000.npy: {'iou_full': 0.8317622544155586, 'dice_full': 0.9081552503995016, 'iou_lcc': 0.8318079050866186, 'dice_lcc': 0.9105302133287925, 'iou': 0.8317622544155586, 'dice': 0.9081552503995016, 'dlr': 0.819746835443038, 'dbr': 0.826530612244898, 'precision': 0.9280720732357073, 'leakage': 0.06925929092788795, 'amr': 0.10636081680878684}
+Testing DataLoader 0:  14%|█▎        | 6/44 [11:57<1:15:42,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 496, 215, 390])
+  Image shape: torch.Size([1, 496, 215, 390])
+  Lung shape: torch.Size([1, 496, 215, 390])
+DEBUG eval_metrics[ATM_629_0000.npy]: Found 129 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=60: volume=91364, IoU=0.8131SELECTED
+  - label=61: volume=417, IoU=0.0031
+  - label=127: volume=394, IoU=0.0000
+  - label=88: volume=386, IoU=0.0027
+  - label=68: volume=292, IoU=0.0022
+  - label=71: volume=292, IoU=0.0023
+  - label=112: volume=276, IoU=0.0000
+  - label=90: volume=190, IoU=0.0011
+  - label=70: volume=173, IoU=0.0009
+  - label=78: volume=107, IoU=0.0000
+DEBUG eval_metrics: Selected component label=60 with IoU=0.8131 (volume=91364), analysis completed in 42.239s
+DEBUG eval_metrics: num_branch=247, median_branch_len=14.0
+DEBUG eval_metrics: DLR=0.8019, DBR=0.7976 (detected 197/247 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_629_0000.npy: {'iou_full': 0.8103866919319361, 'dice_full': 0.8952636423405654, 'iou_lcc': 0.8130980890474562, 'dice_lcc': 0.8972010973552446, 'iou': 0.8103866919319361, 'dice': 0.8952636423405654, 'dlr': 0.8018774703557312, 'dbr': 0.7975708502024291, 'precision': 0.9105150308493415, 'leakage': 0.08690571049136786, 'amr': 0.11572908366533864}
+Testing DataLoader 0:  16%|█▌        | 7/44 [12:57<1:08:30,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 493, 245, 409])
+  Image shape: torch.Size([1, 493, 245, 409])
+  Lung shape: torch.Size([1, 493, 245, 409])
+DEBUG eval_metrics[ATM_630_0000.npy]: Found 1002 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=896: volume=150789, IoU=0.8183SELECTED
+  - label=915: volume=949, IoU=0.0046
+  - label=201: volume=905, IoU=0.0000
+  - label=904: volume=901, IoU=0.0046
+  - label=951: volume=740, IoU=0.0040
+  - label=473: volume=664, IoU=0.0000
+  - label=937: volume=526, IoU=0.0026
+  - label=959: volume=415, IoU=0.0017
+  - label=897: volume=336, IoU=0.0008
+  - label=926: volume=328, IoU=0.0009
+DEBUG eval_metrics: Selected component label=896 with IoU=0.8183 (volume=150789), analysis completed in 129.010s
+DEBUG eval_metrics: num_branch=290, median_branch_len=12.0
+DEBUG eval_metrics: DLR=0.7495, DBR=0.7069 (detected 205/290 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_630_0000.npy: {'iou_full': 0.8139016553013334, 'dice_full': 0.8974043911615753, 'iou_lcc': 0.8183155233827416, 'dice_lcc': 0.9018539022797604, 'iou': 0.8139016553013334, 'dice': 0.8974043911615753, 'dlr': 0.7495361781076066, 'dbr': 0.7068965517241379, 'precision': 0.9447918043621943, 'leakage': 0.05040825070757421, 'amr': 0.1373508662880868}
+Testing DataLoader 0:  18%|█▊        | 8/44 [15:25<1:09:26,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 527, 218, 396])
+  Image shape: torch.Size([1, 527, 218, 396])
+  Lung shape: torch.Size([1, 527, 218, 396])
+DEBUG eval_metrics[ATM_631_0000.npy]: Found 1198 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=1122: volume=108831, IoU=0.8448SELECTED
+  - label=782: volume=8794, IoU=0.0000
+  - label=1117: volume=5516, IoU=0.0000
+  - label=199: volume=838, IoU=0.0000
+  - label=1171: volume=172, IoU=0.0014
+  - label=1162: volume=128, IoU=0.0006
+  - label=1144: volume=119, IoU=0.0007
+  - label=1174: volume=116, IoU=0.0007
+  - label=1155: volume=112, IoU=0.0008
+  - label=1125: volume=92, IoU=0.0000
+DEBUG eval_metrics: Selected component label=1122 with IoU=0.8448 (volume=108831), analysis completed in 125.570s
+DEBUG eval_metrics: num_branch=208, median_branch_len=14.0
+DEBUG eval_metrics: DLR=0.8721, DBR=0.8365 (detected 174/208 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_631_0000.npy: {'iou_full': 0.739933612353875, 'dice_full': 0.8505308560053085, 'iou_lcc': 0.8448490688286013, 'dice_lcc': 0.916315223310934, 'iou': 0.739933612353875, 'dice': 0.8505308560053085, 'dlr': 0.8720832161934214, 'dbr': 0.8365384615384616, 'precision': 0.9346009768996291, 'leakage': 0.06288902819102443, 'amr': 0.10126872853447286}
+Testing DataLoader 0:  20%|██        | 9/44 [17:51<1:09:25,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 525, 224, 383])
+  Image shape: torch.Size([1, 525, 224, 383])
+  Lung shape: torch.Size([1, 525, 224, 383])
+DEBUG eval_metrics[ATM_633_0000.npy]: Found 943 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=871: volume=126098, IoU=0.8244SELECTED
+  - label=943: volume=1072, IoU=0.0000
+  - label=12: volume=856, IoU=0.0000
+  - label=883: volume=750, IoU=0.0038
+  - label=927: volume=383, IoU=0.0020
+  - label=875: volume=329, IoU=0.0016
+  - label=922: volume=234, IoU=0.0009
+  - label=921: volume=220, IoU=0.0014
+  - label=885: volume=218, IoU=0.0011
+  - label=942: volume=183, IoU=0.0000
+DEBUG eval_metrics: Selected component label=871 with IoU=0.8244 (volume=126098), analysis completed in 110.356s
+DEBUG eval_metrics: num_branch=239, median_branch_len=15.0
+DEBUG eval_metrics: DLR=0.8421, DBR=0.8410 (detected 201/239 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_633_0000.npy: {'iou_full': 0.809641920207148, 'dice_full': 0.8948089797947089, 'iou_lcc': 0.8244328122354535, 'dice_lcc': 0.9040867131569589, 'iou': 0.809641920207148, 'dice': 0.8948089797947089, 'dlr': 0.842129955430448, 'dbr': 0.8410041841004184, 'precision': 0.9268226958224026, 'leakage': 0.06967302801862374, 'amr': 0.11756050075838181}
+Testing DataLoader 0:  23%|██▎       | 10/44 [20:01<1:08:03,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 449, 277, 379])
+  Image shape: torch.Size([1, 449, 277, 379])
+  Lung shape: torch.Size([1, 449, 277, 379])
+DEBUG eval_metrics[ATM_635_0000.npy]: Found 421 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=309: volume=91068, IoU=0.7497SELECTED
+  - label=11: volume=6394, IoU=0.0000
+  - label=312: volume=1835, IoU=0.0126
+  - label=319: volume=1447, IoU=0.0093
+  - label=373: volume=1424, IoU=0.0084
+  - label=323: volume=1358, IoU=0.0065
+  - label=335: volume=642, IoU=0.0032
+  - label=390: volume=589, IoU=0.0045
+  - label=345: volume=444, IoU=0.0025
+  - label=378: volume=351, IoU=0.0025
+DEBUG eval_metrics: Selected component label=309 with IoU=0.7497 (volume=91068), analysis completed in 71.791s
+DEBUG eval_metrics: num_branch=223, median_branch_len=13.0
+DEBUG eval_metrics: DLR=0.5145, DBR=0.5022 (detected 112/223 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_635_0000.npy: {'iou_full': 0.7379947229551451, 'dice_full': 0.8492485198117504, 'iou_lcc': 0.7496654782150781, 'dice_lcc': 0.8584057278295448, 'iou': 0.7379947229551451, 'dice': 0.8492485198117504, 'dlr': 0.5144574864013742, 'dbr': 0.5022421524663677, 'precision': 0.953695897340443, 'leakage': 0.037891548992903736, 'amr': 0.21957207368647408}
+Testing DataLoader 0:  25%|██▌       | 11/44 [21:34<1:04:42,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 423, 239, 387])
+  Image shape: torch.Size([1, 423, 239, 387])
+  Lung shape: torch.Size([1, 423, 239, 387])
+DEBUG eval_metrics[ATM_636_0000.npy]: Found 133 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=44: volume=139893, IoU=0.8293SELECTED
+  - label=89: volume=356, IoU=0.0019
+  - label=115: volume=334, IoU=0.0010
+  - label=129: volume=285, IoU=0.0000
+  - label=50: volume=272, IoU=0.0008
+  - label=131: volume=264, IoU=0.0000
+  - label=95: volume=197, IoU=0.0011
+  - label=66: volume=158, IoU=0.0005
+  - label=57: volume=140, IoU=0.0005
+  - label=118: volume=139, IoU=0.0006
+DEBUG eval_metrics: Selected component label=44 with IoU=0.8293 (volume=139893), analysis completed in 38.819s
+DEBUG eval_metrics: num_branch=290, median_branch_len=13.0
+DEBUG eval_metrics: DLR=0.8947, DBR=0.8828 (detected 256/290 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_636_0000.npy: {'iou_full': 0.8205146120084604, 'dice_full': 0.901409531784244, 'iou_lcc': 0.8292807930349937, 'dice_lcc': 0.9068841414768194, 'iou': 0.8205146120084604, 'dice': 0.901409531784244, 'dlr': 0.894724874943156, 'dbr': 0.8827586206896552, 'precision': 0.9137757325883, 'leakage': 0.08493341591824094, 'amr': 0.0999042765843633}
+Testing DataLoader 0:  27%|██▋       | 12/44 [22:30<1:00:00,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 460, 210, 371])
+  Image shape: torch.Size([1, 460, 210, 371])
+  Lung shape: torch.Size([1, 460, 210, 371])
+DEBUG eval_metrics[ATM_638_0000.npy]: Found 80 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=2: volume=87346, IoU=0.8232SELECTED
+  - label=41: volume=433, IoU=0.0036
+  - label=12: volume=343, IoU=0.0021
+  - label=36: volume=288, IoU=0.0025
+  - label=4: volume=142, IoU=0.0009
+  - label=14: volume=113, IoU=0.0005
+  - label=67: volume=100, IoU=0.0007
+  - label=21: volume=98, IoU=0.0008
+  - label=71: volume=87, IoU=0.0006
+  - label=45: volume=83, IoU=0.0004
+DEBUG eval_metrics: Selected component label=2 with IoU=0.8232 (volume=87346), analysis completed in 28.309s
+DEBUG eval_metrics: num_branch=196, median_branch_len=12.0
+DEBUG eval_metrics: DLR=0.7909, DBR=0.7551 (detected 148/196 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_638_0000.npy: {'iou_full': 0.8261006227530794, 'dice_full': 0.904770101340448, 'iou_lcc': 0.8231949009062842, 'dice_lcc': 0.9084445797277906, 'iou': 0.8261006227530794, 'dice': 0.904770101340448, 'dlr': 0.7908771929824562, 'dbr': 0.7551020408163265, 'precision': 0.946869865729987, 'leakage': 0.04898611589933243, 'amr': 0.12698362950658684}
+Testing DataLoader 0:  30%|██▉       | 13/44 [23:16<55:31,  0.01it/s]  Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 128, 242, 390])
+  Image shape: torch.Size([1, 128, 242, 390])
+  Lung shape: torch.Size([1, 128, 242, 390])
+DEBUG eval_metrics[ATM_641_0000.npy]: Found 37 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=12: volume=22607, IoU=0.5870SELECTED
+  - label=10: volume=2638, IoU=0.0699
+  - label=28: volume=1359, IoU=0.0261
+  - label=6: volume=465, IoU=0.0000
+  - label=30: volume=390, IoU=0.0063
+  - label=32: volume=212, IoU=0.0037
+  - label=15: volume=131, IoU=0.0009
+  - label=17: volume=123, IoU=0.0022
+  - label=20: volume=83, IoU=0.0020
+  - label=31: volume=69, IoU=0.0000
+DEBUG eval_metrics: Selected component label=12 with IoU=0.5870 (volume=22607), analysis completed in 5.044s
+DEBUG eval_metrics: num_branch=35, median_branch_len=12.0
+DEBUG eval_metrics: DLR=0.3321, DBR=0.2857 (detected 10/35 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_641_0000.npy: {'iou_full': 0.6536103082201032, 'dice_full': 0.7905251980723679, 'iou_lcc': 0.5869552752293578, 'dice_lcc': 0.7462498877211893, 'iou': 0.6536103082201032, 'dice': 0.7905251980723679, 'dlr': 0.3320825515947467, 'dbr': 0.2857142857142857, 'precision': 0.9062350015271172, 'leakage': 0.06562633604104318, 'amr': 0.36572405790020157}
+Testing DataLoader 0:  32%|███▏      | 14/44 [23:26<50:14,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 459, 234, 397])
+  Image shape: torch.Size([1, 459, 234, 397])
+  Lung shape: torch.Size([1, 459, 234, 397])
+DEBUG eval_metrics[ATM_642_0000.npy]: Found 179 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=58: volume=116577, IoU=0.7160SELECTED
+  - label=141: volume=1821, IoU=0.0093
+  - label=113: volume=579, IoU=0.0032
+  - label=71: volume=451, IoU=0.0024
+  - label=123: volume=439, IoU=0.0019
+  - label=55: volume=284, IoU=0.0015
+  - label=74: volume=278, IoU=0.0014
+  - label=76: volume=232, IoU=0.0013
+  - label=62: volume=232, IoU=0.0009
+  - label=64: volume=224, IoU=0.0012
+DEBUG eval_metrics: Selected component label=58 with IoU=0.7160 (volume=116577), analysis completed in 51.566s
+DEBUG eval_metrics: num_branch=320, median_branch_len=12.0
+DEBUG eval_metrics: DLR=0.6791, DBR=0.6594 (detected 211/320 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_642_0000.npy: {'iou_full': 0.7306234108976216, 'dice_full': 0.8443470789738936, 'iou_lcc': 0.7160130068352246, 'dice_lcc': 0.8362763003950128, 'iou': 0.7306234108976216, 'dice': 0.8443470789738936, 'dlr': 0.6790585129784426, 'dbr': 0.659375, 'precision': 0.9257843891596136, 'leakage': 0.06112992838482068, 'amr': 0.2374497391010429}
+Testing DataLoader 0:  34%|███▍      | 15/44 [24:38<47:37,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 462, 232, 366])
+  Image shape: torch.Size([1, 462, 232, 366])
+  Lung shape: torch.Size([1, 462, 232, 366])
+DEBUG eval_metrics[ATM_644_0000.npy]: Found 89 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=6: volume=68309, IoU=0.8138SELECTED
+  - label=4: volume=6823, IoU=0.0000
+  - label=2: volume=6453, IoU=0.0000
+  - label=3: volume=3258, IoU=0.0000
+  - label=48: volume=2050, IoU=0.0213
+  - label=43: volume=803, IoU=0.0086
+  - label=1: volume=732, IoU=0.0000
+  - label=70: volume=639, IoU=0.0069
+  - label=7: volume=267, IoU=0.0024
+  - label=25: volume=258, IoU=0.0023
+DEBUG eval_metrics: Selected component label=6 with IoU=0.8138 (volume=68309), analysis completed in 28.928s
+DEBUG eval_metrics: num_branch=113, median_branch_len=13.0
+DEBUG eval_metrics: DLR=0.4287, DBR=0.3097 (detected 35/113 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_644_0000.npy: {'iou_full': 0.7060006937218175, 'dice_full': 0.8276675341574495, 'iou_lcc': 0.8137731908096818, 'dice_lcc': 0.8977593597009771, 'iou': 0.7060006937218175, 'dice': 0.8276675341574495, 'dlr': 0.4287169042769857, 'dbr': 0.30973451327433627, 'precision': 0.9696344727719514, 'leakage': 0.026174445873364097, 'amr': 0.1641954762084878}
+Testing DataLoader 0:  36%|███▋      | 16/44 [25:25<44:29,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 479, 241, 341])
+  Image shape: torch.Size([1, 479, 241, 341])
+  Lung shape: torch.Size([1, 479, 241, 341])
+DEBUG eval_metrics[ATM_645_0000.npy]: Found 475 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=385: volume=101465, IoU=0.8025SELECTED
+  - label=387: volume=845, IoU=0.0050
+  - label=383: volume=809, IoU=0.0045
+  - label=388: volume=403, IoU=0.0027
+  - label=425: volume=400, IoU=0.0021
+  - label=423: volume=378, IoU=0.0029
+  - label=2: volume=360, IoU=0.0000
+  - label=459: volume=346, IoU=0.0021
+  - label=391: volume=262, IoU=0.0015
+  - label=442: volume=251, IoU=0.0015
+DEBUG eval_metrics: Selected component label=385 with IoU=0.8025 (volume=101465), analysis completed in 66.909s
+DEBUG eval_metrics: num_branch=228, median_branch_len=14.0
+DEBUG eval_metrics: DLR=0.7538, DBR=0.7544 (detected 172/228 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_645_0000.npy: {'iou_full': 0.804294829842932, 'dice_full': 0.8915337078396968, 'iou_lcc': 0.802463884020487, 'dice_lcc': 0.8905124647202636, 'iou': 0.804294829842932, 'dice': 0.8915337078396968, 'dlr': 0.7538301739807842, 'dbr': 0.7543859649122807, 'precision': 0.9295955067251318, 'leakage': 0.06472330673140507, 'amr': 0.1454168289656047}
+Testing DataLoader 0:  39%|███▊      | 17/44 [26:49<42:37,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 505, 243, 400])
+  Image shape: torch.Size([1, 505, 243, 400])
+  Lung shape: torch.Size([1, 505, 243, 400])
+DEBUG eval_metrics[ATM_646_0000.npy]: Found 1845 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=1757: volume=99583, IoU=0.8038SELECTED
+  - label=14: volume=2680, IoU=0.0000
+  - label=85: volume=1328, IoU=0.0000
+  - label=1814: volume=1311, IoU=0.0108
+  - label=1815: volume=1240, IoU=0.0087
+  - label=1382: volume=929, IoU=0.0000
+  - label=379: volume=891, IoU=0.0000
+  - label=1448: volume=820, IoU=0.0000
+  - label=156: volume=330, IoU=0.0000
+  - label=1782: volume=263, IoU=0.0014
+DEBUG eval_metrics: Selected component label=1757 with IoU=0.8038 (volume=99583), analysis completed in 205.549s
+DEBUG eval_metrics: num_branch=234, median_branch_len=13.5
+DEBUG eval_metrics: DLR=0.7664, DBR=0.6923 (detected 162/234 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_646_0000.npy: {'iou_full': 0.7505727693596044, 'dice_full': 0.8575167882157556, 'iou_lcc': 0.8037602304260775, 'dice_lcc': 0.8917177615571776, 'iou': 0.7505727693596044, 'dice': 0.8575167882157556, 'dlr': 0.7663861259882683, 'dbr': 0.6923076923076923, 'precision': 0.9191998234314492, 'leakage': 0.07610893765001607, 'amr': 0.134168698380299}
+Testing DataLoader 0:  41%|████      | 18/44 [30:36<44:12,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 474, 280, 446])
+  Image shape: torch.Size([1, 474, 280, 446])
+  Lung shape: torch.Size([1, 474, 280, 446])
+DEBUG eval_metrics[ATM_647_0000.npy]: Found 114 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=8: volume=137656, IoU=0.8114SELECTED
+  - label=82: volume=162, IoU=0.0008
+  - label=89: volume=149, IoU=0.0008
+  - label=73: volume=131, IoU=0.0006
+  - label=39: volume=98, IoU=0.0003
+  - label=32: volume=92, IoU=0.0003
+  - label=19: volume=89, IoU=0.0003
+  - label=38: volume=84, IoU=0.0003
+  - label=23: volume=79, IoU=0.0003
+  - label=48: volume=75, IoU=0.0003
+DEBUG eval_metrics: Selected component label=8 with IoU=0.8114 (volume=137656), analysis completed in 57.211s
+DEBUG eval_metrics: num_branch=232, median_branch_len=13.0
+DEBUG eval_metrics: DLR=0.8707, DBR=0.8405 (detected 195/232 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_647_0000.npy: {'iou_full': 0.8105361588288478, 'dice_full': 0.8953548426816796, 'iou_lcc': 0.811416035949326, 'dice_lcc': 0.9038074847991778, 'iou': 0.8105361588288478, 'dice': 0.8953548426816796, 'dlr': 0.8707102952913008, 'dbr': 0.8405172413793104, 'precision': 0.943992443595303, 'leakage': 0.05143386604983703, 'amr': 0.13309588897066554}
+Testing DataLoader 0:  43%|████▎     | 19/44 [31:56<42:02,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 482, 216, 425])
+  Image shape: torch.Size([1, 482, 216, 425])
+  Lung shape: torch.Size([1, 482, 216, 425])
+DEBUG eval_metrics[ATM_648_0000.npy]: Found 284 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=175: volume=128226, IoU=0.8208SELECTED
+  - label=188: volume=1348, IoU=0.0064
+  - label=215: volume=391, IoU=0.0017
+  - label=208: volume=275, IoU=0.0009
+  - label=200: volume=240, IoU=0.0011
+  - label=210: volume=219, IoU=0.0006
+  - label=222: volume=153, IoU=0.0007
+  - label=234: volume=137, IoU=0.0006
+  - label=273: volume=130, IoU=0.0005
+  - label=227: volume=100, IoU=0.0000
+DEBUG eval_metrics: Selected component label=175 with IoU=0.8208 (volume=128226), analysis completed in 62.478s
+DEBUG eval_metrics: num_branch=301, median_branch_len=11.0
+DEBUG eval_metrics: DLR=0.8030, DBR=0.7973 (detected 240/301 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_648_0000.npy: {'iou_full': 0.8184526580392887, 'dice_full': 0.9001638337087856, 'iou_lcc': 0.8207719088288092, 'dice_lcc': 0.9112096601046857, 'iou': 0.8184526580392887, 'dice': 0.9001638337087856, 'dlr': 0.8030340102764865, 'dbr': 0.7973421926910299, 'precision': 0.9424187200416545, 'leakage': 0.053889812532247894, 'amr': 0.1179986240898928}
+Testing DataLoader 0:  45%|████▌     | 20/44 [33:19<39:59,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 378, 207, 354])
+  Image shape: torch.Size([1, 378, 207, 354])
+  Lung shape: torch.Size([1, 378, 207, 354])
+DEBUG eval_metrics[ATM_651_0000.npy]: Found 377 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=313: volume=54883, IoU=0.7798SELECTED
+  - label=36: volume=6296, IoU=0.0000
+  - label=146: volume=3327, IoU=0.0000
+  - label=349: volume=1976, IoU=0.0258
+  - label=34: volume=1255, IoU=0.0000
+  - label=119: volume=860, IoU=0.0000
+  - label=331: volume=386, IoU=0.0047
+  - label=357: volume=328, IoU=0.0037
+  - label=323: volume=247, IoU=0.0032
+  - label=91: volume=219, IoU=0.0000
+DEBUG eval_metrics: Selected component label=313 with IoU=0.7798 (volume=54883), analysis completed in 28.572s
+DEBUG eval_metrics: num_branch=116, median_branch_len=11.0
+DEBUG eval_metrics: DLR=0.5766, DBR=0.4914 (detected 57/116 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_651_0000.npy: {'iou_full': 0.6856247637857674, 'dice_full': 0.8134963112975553, 'iou_lcc': 0.7798317110355342, 'dice_lcc': 0.8869145230111527, 'iou': 0.6856247637857674, 'dice': 0.8134963112975553, 'dlr': 0.5765765765765766, 'dbr': 0.49137931034482757, 'precision': 0.9699148837458289, 'leakage': 0.025341950999549074, 'amr': 0.18300015030813166}
+Testing DataLoader 0:  48%|████▊     | 21/44 [34:03<37:18,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 440, 205, 335])
+  Image shape: torch.Size([1, 440, 205, 335])
+  Lung shape: torch.Size([1, 440, 205, 335])
+DEBUG eval_metrics[ATM_652_0000.npy]: Found 88 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=22: volume=65551, IoU=0.8222SELECTED
+  - label=83: volume=5906, IoU=0.0000
+  - label=7: volume=1919, IoU=0.0000
+  - label=57: volume=477, IoU=0.0052
+  - label=63: volume=220, IoU=0.0026
+  - label=54: volume=171, IoU=0.0021
+  - label=36: volume=58, IoU=0.0007
+  - label=51: volume=42, IoU=0.0003
+  - label=86: volume=41, IoU=0.0002
+  - label=71: volume=40, IoU=0.0005
+DEBUG eval_metrics: Selected component label=22 with IoU=0.8222 (volume=65551), analysis completed in 25.306s
+DEBUG eval_metrics: num_branch=148, median_branch_len=13.0
+DEBUG eval_metrics: DLR=0.8092, DBR=0.7095 (detected 105/148 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_652_0000.npy: {'iou_full': 0.7530183443255126, 'dice_full': 0.8591106268374417, 'iou_lcc': 0.8222326203208556, 'dice_lcc': 0.9061928785552387, 'iou': 0.7530183443255126, 'dice': 0.8591106268374417, 'dlr': 0.8092050209205021, 'dbr': 0.7094594594594594, 'precision': 0.9386833893786543, 'leakage': 0.05721393034825871, 'amr': 0.12412369968340117}
+Testing DataLoader 0:  50%|█████     | 22/44 [34:41<34:41,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 542, 273, 421])
+  Image shape: torch.Size([1, 542, 273, 421])
+  Lung shape: torch.Size([1, 542, 273, 421])
+DEBUG eval_metrics[ATM_679_0000.npy]: Found 1880 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=1749: volume=242833, IoU=0.8196SELECTED
+  - label=1778: volume=2349, IoU=0.0069
+  - label=1783: volume=1372, IoU=0.0043
+  - label=1785: volume=613, IoU=0.0016
+  - label=1840: volume=587, IoU=0.0019
+  - label=1792: volume=554, IoU=0.0015
+  - label=1853: volume=546, IoU=0.0000
+  - label=1546: volume=532, IoU=0.0000
+  - label=1844: volume=499, IoU=0.0009
+  - label=1769: volume=437, IoU=0.0013
+DEBUG eval_metrics: Selected component label=1749 with IoU=0.8196 (volume=242833), analysis completed in 271.677s
+DEBUG eval_metrics: num_branch=302, median_branch_len=15.0
+DEBUG eval_metrics: DLR=0.7657, DBR=0.7483 (detected 226/302 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_679_0000.npy: {'iou_full': 0.8154631085868793, 'dice_full': 0.8983527175296002, 'iou_lcc': 0.8195896966711239, 'dice_lcc': 0.9025765392814112, 'iou': 0.8154631085868793, 'dice': 0.8983527175296002, 'dlr': 0.7656536067374589, 'dbr': 0.7483443708609272, 'precision': 0.9592769838207892, 'leakage': 0.036177613779725656, 'amr': 0.14779514180078612}
+Testing DataLoader 0:  52%|█████▏    | 23/44 [39:41<36:14,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 479, 231, 386])
+  Image shape: torch.Size([1, 479, 231, 386])
+  Lung shape: torch.Size([1, 479, 231, 386])
+DEBUG eval_metrics[ATM_680_0000.npy]: Found 1188 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=1136: volume=96737, IoU=0.8031SELECTED
+  - label=1164: volume=680, IoU=0.0046
+  - label=1153: volume=662, IoU=0.0051
+  - label=1158: volume=300, IoU=0.0023
+  - label=1148: volume=198, IoU=0.0012
+  - label=1166: volume=173, IoU=0.0010
+  - label=1186: volume=123, IoU=0.0006
+  - label=1146: volume=107, IoU=0.0006
+  - label=1172: volume=105, IoU=0.0007
+  - label=1156: volume=103, IoU=0.0005
+DEBUG eval_metrics: Selected component label=1136 with IoU=0.8031 (volume=96737), analysis completed in 124.957s
+DEBUG eval_metrics: num_branch=234, median_branch_len=15.0
+DEBUG eval_metrics: DLR=0.8402, DBR=0.8333 (detected 195/234 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_680_0000.npy: {'iou_full': 0.7993144997438207, 'dice_full': 0.8884655793721709, 'iou_lcc': 0.8031219033246362, 'dice_lcc': 0.8911983952179107, 'iou': 0.7993144997438207, 'dice': 0.8884655793721709, 'dlr': 0.8402146022859809, 'dbr': 0.8333333333333334, 'precision': 0.9132698386463649, 'leakage': 0.08263698191946929, 'amr': 0.12983139929725102}
+Testing DataLoader 0:  55%|█████▍    | 24/44 [42:07<35:06,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 465, 207, 381])
+  Image shape: torch.Size([1, 465, 207, 381])
+  Lung shape: torch.Size([1, 465, 207, 381])
+DEBUG eval_metrics[ATM_682_0000.npy]: Found 479 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=446: volume=67121, IoU=0.8255SELECTED
+  - label=81: volume=1447, IoU=0.0000
+  - label=475: volume=293, IoU=0.0032
+  - label=476: volume=184, IoU=0.0018
+  - label=461: volume=139, IoU=0.0013
+  - label=455: volume=58, IoU=0.0005
+  - label=478: volume=56, IoU=0.0004
+  - label=470: volume=52, IoU=0.0003
+  - label=479: volume=41, IoU=0.0004
+  - label=459: volume=35, IoU=0.0005
+DEBUG eval_metrics: Selected component label=446 with IoU=0.8255 (volume=67121), analysis completed in 54.717s
+DEBUG eval_metrics: num_branch=146, median_branch_len=14.0
+DEBUG eval_metrics: DLR=0.7566, DBR=0.6986 (detected 102/146 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_682_0000.npy: {'iou_full': 0.8094214353461904, 'dice_full': 0.8946743080793962, 'iou_lcc': 0.8255154336684793, 'dice_lcc': 0.9051073004269172, 'iou': 0.8094214353461904, 'dice': 0.8946743080793962, 'dlr': 0.7566462167689162, 'dbr': 0.6986301369863014, 'precision': 0.9431921320061302, 'leakage': 0.052398270774720375, 'amr': 0.13002127221574145}
+Testing DataLoader 0:  57%|█████▋    | 25/44 [43:21<32:57,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 491, 232, 381])
+  Image shape: torch.Size([1, 491, 232, 381])
+  Lung shape: torch.Size([1, 491, 232, 381])
+DEBUG eval_metrics[ATM_683_0000.npy]: Found 60 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=7: volume=145398, IoU=0.8540SELECTED
+  - label=6: volume=1513, IoU=0.0000
+  - label=15: volume=383, IoU=0.0012
+  - label=23: volume=381, IoU=0.0014
+  - label=1: volume=333, IoU=0.0000
+  - label=33: volume=279, IoU=0.0011
+  - label=20: volume=141, IoU=0.0003
+  - label=5: volume=138, IoU=0.0000
+  - label=31: volume=124, IoU=0.0006
+  - label=26: volume=118, IoU=0.0003
+DEBUG eval_metrics: Selected component label=7 with IoU=0.8540 (volume=145398), analysis completed in 37.165s
+DEBUG eval_metrics: num_branch=242, median_branch_len=15.0
+DEBUG eval_metrics: DLR=0.8475, DBR=0.8471 (detected 205/242 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_683_0000.npy: {'iou_full': 0.8433813771179902, 'dice_full': 0.9150373195551791, 'iou_lcc': 0.8539809057774527, 'dice_lcc': 0.9213833162725686, 'iou': 0.8433813771179902, 'dice': 0.9150373195551791, 'dlr': 0.8475440222428174, 'dbr': 0.8471074380165289, 'precision': 0.9314342292539037, 'leakage': 0.06710181010699146, 'amr': 0.08845299777942264}
+Testing DataLoader 0:  59%|█████▉    | 26/44 [44:26<30:45,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 485, 211, 354])
+  Image shape: torch.Size([1, 485, 211, 354])
+  Lung shape: torch.Size([1, 485, 211, 354])
+DEBUG eval_metrics[ATM_684_0000.npy]: Found 320 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=219: volume=130322, IoU=0.8033SELECTED
+  - label=300: volume=908, IoU=0.0044
+  - label=267: volume=462, IoU=0.0015
+  - label=248: volume=369, IoU=0.0012
+  - label=272: volume=323, IoU=0.0012
+  - label=305: volume=274, IoU=0.0013
+  - label=221: volume=243, IoU=0.0012
+  - label=38: volume=194, IoU=0.0000
+  - label=236: volume=180, IoU=0.0007
+  - label=240: volume=169, IoU=0.0007
+DEBUG eval_metrics: Selected component label=219 with IoU=0.8033 (volume=130322), analysis completed in 51.900s
+DEBUG eval_metrics: num_branch=261, median_branch_len=15.0
+DEBUG eval_metrics: DLR=0.8277, DBR=0.8314 (detected 217/261 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_684_0000.npy: {'iou_full': 0.8007852431584225, 'dice_full': 0.8893733955237372, 'iou_lcc': 0.8032620252910612, 'dice_lcc': 0.8919466642955323, 'iou': 0.8007852431584225, 'dice': 0.8893733955237372, 'dlr': 0.8276999175597691, 'dbr': 0.8314176245210728, 'precision': 0.9218621962520199, 'leakage': 0.07322587127519091, 'amr': 0.13608830453005685}
+Testing DataLoader 0:  61%|██████▏   | 27/44 [45:35<28:42,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 465, 239, 434])
+  Image shape: torch.Size([1, 465, 239, 434])
+  Lung shape: torch.Size([1, 465, 239, 434])
+DEBUG eval_metrics[ATM_685_0000.npy]: Found 563 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=478: volume=122719, IoU=0.8169SELECTED
+  - label=27: volume=2603, IoU=0.0000
+  - label=497: volume=700, IoU=0.0037
+  - label=500: volume=460, IoU=0.0023
+  - label=485: volume=351, IoU=0.0016
+  - label=522: volume=301, IoU=0.0016
+  - label=501: volume=247, IoU=0.0015
+  - label=33: volume=233, IoU=0.0000
+  - label=561: volume=210, IoU=0.0000
+  - label=26: volume=208, IoU=0.0000
+DEBUG eval_metrics: Selected component label=478 with IoU=0.8169 (volume=122719), analysis completed in 87.096s
+DEBUG eval_metrics: num_branch=232, median_branch_len=14.5
+DEBUG eval_metrics: DLR=0.7437, DBR=0.7284 (detected 169/232 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_685_0000.npy: {'iou_full': 0.7978435193546853, 'dice_full': 0.8875561312934085, 'iou_lcc': 0.8169177206195822, 'dice_lcc': 0.9048799181428065, 'iou': 0.7978435193546853, 'dice': 0.8875561312934085, 'dlr': 0.7436661698956781, 'dbr': 0.728448275862069, 'precision': 0.9375438370190021, 'leakage': 0.05825074815405206, 'amr': 0.12558461283967698}
+Testing DataLoader 0:  64%|██████▎   | 28/44 [47:25<27:05,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 421, 216, 358])
+  Image shape: torch.Size([1, 421, 216, 358])
+  Lung shape: torch.Size([1, 421, 216, 358])
+DEBUG eval_metrics[ATM_686_0000.npy]: Found 114 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=71: volume=103011, IoU=0.8148SELECTED
+  - label=1: volume=13012, IoU=0.0000
+  - label=39: volume=2011, IoU=0.0000
+  - label=3: volume=1507, IoU=0.0000
+  - label=35: volume=479, IoU=0.0000
+  - label=85: volume=361, IoU=0.0020
+  - label=89: volume=208, IoU=0.0012
+  - label=73: volume=124, IoU=0.0006
+  - label=109: volume=97, IoU=0.0002
+  - label=76: volume=96, IoU=0.0000
+DEBUG eval_metrics: Selected component label=71 with IoU=0.8148 (volume=103011), analysis completed in 25.854s
+DEBUG eval_metrics: num_branch=215, median_branch_len=14.0
+DEBUG eval_metrics: DLR=0.8535, DBR=0.8512 (detected 183/215 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_686_0000.npy: {'iou_full': 0.7094770393980949, 'dice_full': 0.8300515573439946, 'iou_lcc': 0.8147874560868557, 'dice_lcc': 0.8981198862372644, 'iou': 0.7094770393980949, 'dice': 0.8300515573439946, 'dlr': 0.8534927969556945, 'dbr': 0.8511627906976744, 'precision': 0.9208986365180261, 'leakage': 0.07528262154573666, 'amr': 0.12355918427663662}
+Testing DataLoader 0:  66%|██████▌   | 29/44 [48:07<24:53,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 496, 232, 398])
+  Image shape: torch.Size([1, 496, 232, 398])
+  Lung shape: torch.Size([1, 496, 232, 398])
+DEBUG eval_metrics[ATM_687_0000.npy]: Found 150 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=84: volume=116422, IoU=0.8165SELECTED
+  - label=1: volume=1082, IoU=0.0000
+  - label=96: volume=792, IoU=0.0047
+  - label=120: volume=437, IoU=0.0022
+  - label=94: volume=353, IoU=0.0022
+  - label=137: volume=298, IoU=0.0020
+  - label=93: volume=237, IoU=0.0013
+  - label=119: volume=217, IoU=0.0010
+  - label=123: volume=198, IoU=0.0008
+  - label=110: volume=184, IoU=0.0010
+DEBUG eval_metrics: Selected component label=84 with IoU=0.8165 (volume=116422), analysis completed in 46.316s
+DEBUG eval_metrics: num_branch=221, median_branch_len=14.0
+DEBUG eval_metrics: DLR=0.8303, DBR=0.8326 (detected 184/221 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_687_0000.npy: {'iou_full': 0.8120414503205716, 'dice_full': 0.8962724888847459, 'iou_lcc': 0.8165466810699744, 'dice_lcc': 0.8992021154957569, 'iou': 0.8120414503205716, 'dice': 0.8962724888847459, 'dlr': 0.8303108808290155, 'dbr': 0.832579185520362, 'precision': 0.9284757521637588, 'leakage': 0.06715196659330737, 'amr': 0.12828202213677073}
+Testing DataLoader 0:  68%|██████▊   | 30/44 [49:14<22:58,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 485, 226, 381])
+  Image shape: torch.Size([1, 485, 226, 381])
+  Lung shape: torch.Size([1, 485, 226, 381])
+DEBUG eval_metrics[ATM_688_0000.npy]: Found 105 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=39: volume=121646, IoU=0.8055SELECTED
+  - label=1: volume=19287, IoU=0.0000
+  - label=2: volume=12964, IoU=0.0000
+  - label=4: volume=5647, IoU=0.0000
+  - label=81: volume=911, IoU=0.0057
+  - label=83: volume=894, IoU=0.0050
+  - label=90: volume=653, IoU=0.0039
+  - label=43: volume=595, IoU=0.0034
+  - label=7: volume=409, IoU=0.0000
+  - label=63: volume=342, IoU=0.0018
+DEBUG eval_metrics: Selected component label=39 with IoU=0.8055 (volume=121646), analysis completed in 39.777s
+DEBUG eval_metrics: num_branch=280, median_branch_len=14.0
+DEBUG eval_metrics: DLR=0.7718, DBR=0.7571 (detected 212/280 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_688_0000.npy: {'iou_full': 0.6435019359733986, 'dice_full': 0.7830863133024191, 'iou_lcc': 0.8055133038732978, 'dice_lcc': 0.8931567839717223, 'iou': 0.6435019359733986, 'dice': 0.7830863133024191, 'dlr': 0.7717824900272937, 'dbr': 0.7571428571428571, 'precision': 0.9186993204425331, 'leakage': 0.07690217602260642, 'amr': 0.13100385830622685}
+Testing DataLoader 0:  70%|███████   | 31/44 [50:13<21:03,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 473, 247, 407])
+  Image shape: torch.Size([1, 473, 247, 407])
+  Lung shape: torch.Size([1, 473, 247, 407])
+DEBUG eval_metrics[ATM_689_0000.npy]: Found 56 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=8: volume=112223, IoU=0.8112SELECTED
+  - label=10: volume=704, IoU=0.0049
+  - label=46: volume=280, IoU=0.0015
+  - label=37: volume=170, IoU=0.0012
+  - label=23: volume=168, IoU=0.0011
+  - label=11: volume=136, IoU=0.0006
+  - label=26: volume=120, IoU=0.0010
+  - label=21: volume=110, IoU=0.0003
+  - label=25: volume=106, IoU=0.0006
+  - label=53: volume=95, IoU=0.0005
+DEBUG eval_metrics: Selected component label=8 with IoU=0.8112 (volume=112223), analysis completed in 39.681s
+DEBUG eval_metrics: num_branch=218, median_branch_len=15.0
+DEBUG eval_metrics: DLR=0.8569, DBR=0.8532 (detected 186/218 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_689_0000.npy: {'iou_full': 0.8173523762314889, 'dice_full': 0.8994979585922384, 'iou_lcc': 0.8112346556856984, 'dice_lcc': 0.8962665263775216, 'iou': 0.8173523762314889, 'dice': 0.8994979585922384, 'dlr': 0.8568917901079588, 'dbr': 0.8532110091743119, 'precision': 0.9251991987536168, 'leakage': 0.07026434849511194, 'amr': 0.13091146290674627}
+Testing DataLoader 0:  73%|███████▎  | 32/44 [51:15<19:13,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 474, 260, 429])
+  Image shape: torch.Size([1, 474, 260, 429])
+  Lung shape: torch.Size([1, 474, 260, 429])
+DEBUG eval_metrics[ATM_690_0000.npy]: Found 150 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=27: volume=112484, IoU=0.7345SELECTED
+  - label=118: volume=471, IoU=0.0028
+  - label=126: volume=432, IoU=0.0021
+  - label=133: volume=256, IoU=0.0013
+  - label=44: volume=254, IoU=0.0010
+  - label=58: volume=189, IoU=0.0008
+  - label=54: volume=171, IoU=0.0004
+  - label=90: volume=133, IoU=0.0007
+  - label=52: volume=129, IoU=0.0004
+  - label=105: volume=124, IoU=0.0005
+DEBUG eval_metrics: Selected component label=27 with IoU=0.7345 (volume=112484), analysis completed in 49.605s
+DEBUG eval_metrics: num_branch=174, median_branch_len=17.0
+DEBUG eval_metrics: DLR=0.7522, DBR=0.7414 (detected 129/174 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_690_0000.npy: {'iou_full': 0.7345797444585052, 'dice_full': 0.8469829614986351, 'iou_lcc': 0.734456408475165, 'dice_lcc': 0.8486164601055002, 'iou': 0.7345797444585052, 'dice': 0.8469829614986351, 'dlr': 0.7522346368715084, 'dbr': 0.7413793103448276, 'precision': 0.940109520096406, 'leakage': 0.04926708020205407, 'amr': 0.22664752060995255}
+Testing DataLoader 0:  75%|███████▌  | 33/44 [52:30<17:30,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 510, 232, 365])
+  Image shape: torch.Size([1, 510, 232, 365])
+  Lung shape: torch.Size([1, 510, 232, 365])
+DEBUG eval_metrics[ATM_691_0000.npy]: Found 137 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=11: volume=139724, IoU=0.8200SELECTED
+  - label=113: volume=2596, IoU=0.0000
+  - label=50: volume=2590, IoU=0.0120
+  - label=61: volume=2231, IoU=0.0119
+  - label=1: volume=2162, IoU=0.0000
+  - label=103: volume=1085, IoU=0.0055
+  - label=121: volume=971, IoU=0.0000
+  - label=15: volume=694, IoU=0.0030
+  - label=20: volume=580, IoU=0.0023
+  - label=55: volume=486, IoU=0.0016
+DEBUG eval_metrics: Selected component label=11 with IoU=0.8200 (volume=139724), analysis completed in 41.674s
+DEBUG eval_metrics: num_branch=245, median_branch_len=16.0
+DEBUG eval_metrics: DLR=0.6657, DBR=0.6816 (detected 167/245 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_691_0000.npy: {'iou_full': 0.8115065622908361, 'dice_full': 0.8959465885286142, 'iou_lcc': 0.8200413985454227, 'dice_lcc': 0.9012673535363251, 'iou': 0.8115065622908361, 'dice': 0.8959465885286142, 'dlr': 0.6656541109761037, 'dbr': 0.6816326530612244, 'precision': 0.9385240623345401, 'leakage': 0.056781458791807925, 'amr': 0.13314432614973862}
+Testing DataLoader 0:  77%|███████▋  | 34/44 [53:31<15:44,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 530, 256, 414])
+  Image shape: torch.Size([1, 530, 256, 414])
+  Lung shape: torch.Size([1, 530, 256, 414])
+DEBUG eval_metrics[ATM_692_0000.npy]: Found 187 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=75: volume=135143, IoU=0.7720SELECTED
+  - label=4: volume=1367, IoU=0.0000
+  - label=2: volume=736, IoU=0.0000
+  - label=109: volume=579, IoU=0.0024
+  - label=157: volume=342, IoU=0.0015
+  - label=158: volume=242, IoU=0.0010
+  - label=84: volume=190, IoU=0.0007
+  - label=122: volume=186, IoU=0.0000
+  - label=87: volume=182, IoU=0.0000
+  - label=138: volume=168, IoU=0.0008
+DEBUG eval_metrics: Selected component label=75 with IoU=0.7720 (volume=135143), analysis completed in 59.988s
+DEBUG eval_metrics: num_branch=190, median_branch_len=16.0
+DEBUG eval_metrics: DLR=0.7106, DBR=0.6895 (detected 131/190 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_692_0000.npy: {'iou_full': 0.7643234528235138, 'dice_full': 0.8664210086878774, 'iou_lcc': 0.7719950730079764, 'dice_lcc': 0.8724662987820705, 'iou': 0.7643234528235138, 'dice': 0.8664210086878774, 'dlr': 0.7106135986733002, 'dbr': 0.6894736842105263, 'precision': 0.9554569483616604, 'leakage': 0.03742346891302595, 'amr': 0.19725945821883395}
+Testing DataLoader 0:  80%|███████▉  | 35/44 [54:54<14:07,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 465, 217, 332])
+  Image shape: torch.Size([1, 465, 217, 332])
+  Lung shape: torch.Size([1, 465, 217, 332])
+DEBUG eval_metrics[ATM_695_0000.npy]: Found 85 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=13: volume=68830, IoU=0.7643SELECTED
+  - label=20: volume=6160, IoU=0.0691
+  - label=76: volume=3131, IoU=0.0000
+  - label=73: volume=857, IoU=0.0000
+  - label=85: volume=817, IoU=0.0000
+  - label=56: volume=813, IoU=0.0089
+  - label=53: volume=383, IoU=0.0043
+  - label=21: volume=306, IoU=0.0025
+  - label=43: volume=248, IoU=0.0022
+  - label=27: volume=187, IoU=0.0000
+DEBUG eval_metrics: Selected component label=13 with IoU=0.7643 (volume=68830), analysis completed in 21.228s
+DEBUG eval_metrics: num_branch=137, median_branch_len=13.0
+DEBUG eval_metrics: DLR=0.6390, DBR=0.6277 (detected 86/137 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_695_0000.npy: {'iou_full': 0.7884602875170754, 'dice_full': 0.8817196479231832, 'iou_lcc': 0.7643073526994341, 'dice_lcc': 0.8665615288895987, 'iou': 0.7884602875170754, 'dice': 0.8817196479231832, 'dlr': 0.6390328151986183, 'dbr': 0.6277372262773723, 'precision': 0.9457225853304285, 'leakage': 0.04589274091539869, 'amr': 0.2003708752410075}
+Testing DataLoader 0:  82%|████████▏ | 36/44 [55:33<12:20,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 440, 190, 341])
+  Image shape: torch.Size([1, 440, 190, 341])
+  Lung shape: torch.Size([1, 440, 190, 341])
+DEBUG eval_metrics[ATM_696_0000.npy]: Found 64 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=4: volume=79257, IoU=0.8176SELECTED
+  - label=27: volume=509, IoU=0.0044
+  - label=43: volume=468, IoU=0.0045
+  - label=21: volume=409, IoU=0.0035
+  - label=12: volume=204, IoU=0.0014
+  - label=13: volume=97, IoU=0.0000
+  - label=35: volume=86, IoU=0.0007
+  - label=62: volume=82, IoU=0.0000
+  - label=39: volume=78, IoU=0.0007
+  - label=8: volume=65, IoU=0.0000
+DEBUG eval_metrics: Selected component label=4 with IoU=0.8176 (volume=79257), analysis completed in 18.737s
+DEBUG eval_metrics: num_branch=196, median_branch_len=12.0
+DEBUG eval_metrics: DLR=0.7853, DBR=0.7602 (detected 149/196 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_696_0000.npy: {'iou_full': 0.8251977450509111, 'dice_full': 0.9042283196858689, 'iou_lcc': 0.8175628549603109, 'dice_lcc': 0.8999202284753895, 'iou': 0.8251977450509111, 'dice': 0.9042283196858689, 'dlr': 0.7853286757700857, 'dbr': 0.7602040816326531, 'precision': 0.9317915284800948, 'leakage': 0.06369674274005512, 'amr': 0.12984290727525377}
+Testing DataLoader 0:  84%|████████▍ | 37/44 [56:05<10:36,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 524, 249, 428])
+  Image shape: torch.Size([1, 524, 249, 428])
+  Lung shape: torch.Size([1, 524, 249, 428])
+DEBUG eval_metrics[ATM_697_0000.npy]: Found 521 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=426: volume=162733, IoU=0.8016SELECTED
+  - label=74: volume=11288, IoU=0.0000
+  - label=1: volume=2798, IoU=0.0000
+  - label=413: volume=1090, IoU=0.0000
+  - label=61: volume=1052, IoU=0.0000
+  - label=452: volume=636, IoU=0.0022
+  - label=453: volume=392, IoU=0.0018
+  - label=168: volume=390, IoU=0.0000
+  - label=435: volume=258, IoU=0.0009
+  - label=445: volume=175, IoU=0.0006
+DEBUG eval_metrics: Selected component label=426 with IoU=0.8016 (volume=162733), analysis completed in 102.475s
+DEBUG eval_metrics: num_branch=315, median_branch_len=14.0
+DEBUG eval_metrics: DLR=0.8850, DBR=0.8603 (detected 271/315 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_697_0000.npy: {'iou_full': 0.7332662280509805, 'dice_full': 0.84610917374825, 'iou_lcc': 0.8016093274428442, 'dice_lcc': 0.9007747546806866, 'iou': 0.7332662280509805, 'dice': 0.84610917374825, 'dlr': 0.8850262538475466, 'dbr': 0.8603174603174604, 'precision': 0.919293744994249, 'leakage': 0.07751884178683185, 'amr': 0.11701284654138253}
+Testing DataLoader 0:  86%|████████▋ | 38/44 [58:14<09:11,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 499, 220, 360])
+  Image shape: torch.Size([1, 499, 220, 360])
+  Lung shape: torch.Size([1, 499, 220, 360])
+DEBUG eval_metrics[ATM_698_0000.npy]: Found 146 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=84: volume=97159, IoU=0.8049SELECTED
+  - label=1: volume=3836, IoU=0.0000
+  - label=90: volume=1722, IoU=0.0116
+  - label=94: volume=507, IoU=0.0032
+  - label=145: volume=457, IoU=0.0000
+  - label=115: volume=278, IoU=0.0026
+  - label=112: volume=203, IoU=0.0014
+  - label=86: volume=173, IoU=0.0010
+  - label=91: volume=111, IoU=0.0007
+  - label=104: volume=100, IoU=0.0005
+DEBUG eval_metrics: Selected component label=84 with IoU=0.8049 (volume=97159), analysis completed in 38.048s
+DEBUG eval_metrics: num_branch=208, median_branch_len=13.0
+DEBUG eval_metrics: DLR=0.7617, DBR=0.7885 (detected 164/208 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_698_0000.npy: {'iou_full': 0.7829124439275628, 'dice_full': 0.8782399232156253, 'iou_lcc': 0.8049342944909473, 'dice_lcc': 0.8923261414267468, 'iou': 0.7829124439275628, 'dice': 0.8782399232156253, 'dlr': 0.7616609783845278, 'dbr': 0.7884615384615384, 'precision': 0.9412956506535847, 'leakage': 0.052898382836754555, 'amr': 0.15180019461563413}
+Testing DataLoader 0:  89%|████████▊ | 39/44 [59:10<07:35,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 535, 255, 417])
+  Image shape: torch.Size([1, 535, 255, 417])
+  Lung shape: torch.Size([1, 535, 255, 417])
+DEBUG eval_metrics[ATM_699_0000.npy]: Found 169 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=33: volume=194710, IoU=0.7892SELECTED
+  - label=5: volume=19742, IoU=0.0000
+  - label=1: volume=19680, IoU=0.0000
+  - label=7: volume=11871, IoU=0.0000
+  - label=3: volume=8750, IoU=0.0000
+  - label=9: volume=5236, IoU=0.0000
+  - label=17: volume=4610, IoU=0.0000
+  - label=116: volume=872, IoU=0.0000
+  - label=139: volume=867, IoU=0.0030
+  - label=82: volume=716, IoU=0.0026
+DEBUG eval_metrics: Selected component label=33 with IoU=0.7892 (volume=194710), analysis completed in 68.932s
+DEBUG eval_metrics: num_branch=345, median_branch_len=15.0
+DEBUG eval_metrics: DLR=0.7413, DBR=0.7159 (detected 247/345 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_699_0000.npy: {'iou_full': 0.6120624691422186, 'dice_full': 0.7593532891661428, 'iou_lcc': 0.7891938771085383, 'dice_lcc': 0.88256941634788, 'iou': 0.6120624691422186, 'dice': 0.7593532891661428, 'dlr': 0.741301814549692, 'dbr': 0.7159420289855073, 'precision': 0.9347195779685632, 'leakage': 0.058381062525241396, 'amr': 0.1640690971839777}
+Testing DataLoader 0:  91%|█████████ | 40/44 [1:00:44<06:04,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 443, 212, 384])
+  Image shape: torch.Size([1, 443, 212, 384])
+  Lung shape: torch.Size([1, 443, 212, 384])
+DEBUG eval_metrics[ATM_700_0000.npy]: Found 99 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=11: volume=116302, IoU=0.8472SELECTED
+  - label=2: volume=8457, IoU=0.0000
+  - label=1: volume=5357, IoU=0.0000
+  - label=48: volume=1976, IoU=0.0000
+  - label=99: volume=1054, IoU=0.0000
+  - label=12: volume=559, IoU=0.0031
+  - label=33: volume=221, IoU=0.0007
+  - label=31: volume=101, IoU=0.0005
+  - label=27: volume=88, IoU=0.0006
+  - label=46: volume=85, IoU=0.0003
+DEBUG eval_metrics: Selected component label=11 with IoU=0.8472 (volume=116302), analysis completed in 35.135s
+DEBUG eval_metrics: num_branch=235, median_branch_len=13.0
+DEBUG eval_metrics: DLR=0.8091, DBR=0.7574 (detected 178/235 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_700_0000.npy: {'iou_full': 0.7500306343349626, 'dice_full': 0.857162862888952, 'iou_lcc': 0.8471892996759126, 'dice_lcc': 0.917497802100729, 'iou': 0.7500306343349626, 'dice': 0.857162862888952, 'dlr': 0.8090597840400316, 'dbr': 0.7574468085106383, 'precision': 0.9372942683042121, 'leakage': 0.060111720796875774, 'amr': 0.1014797238288266}
+Testing DataLoader 0:  93%|█████████▎| 41/44 [1:01:37<04:30,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 516, 275, 438])
+  Image shape: torch.Size([1, 516, 275, 438])
+  Lung shape: torch.Size([1, 516, 275, 438])
+DEBUG eval_metrics[ATM_701_0000.npy]: Found 1452 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=1315: volume=150010, IoU=0.8278SELECTED
+  - label=52: volume=13895, IoU=0.0000
+  - label=1368: volume=795, IoU=0.0040
+  - label=1331: volume=547, IoU=0.0024
+  - label=557: volume=496, IoU=0.0000
+  - label=1330: volume=445, IoU=0.0016
+  - label=1344: volume=275, IoU=0.0011
+  - label=1345: volume=198, IoU=0.0008
+  - label=1348: volume=183, IoU=0.0008
+  - label=1339: volume=178, IoU=0.0007
+DEBUG eval_metrics: Selected component label=1315 with IoU=0.8278 (volume=150010), analysis completed in 221.531s
+DEBUG eval_metrics: num_branch=261, median_branch_len=15.0
+DEBUG eval_metrics: DLR=0.8026, DBR=0.7969 (detected 208/261 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_701_0000.npy: {'iou_full': 0.7537630055676184, 'dice_full': 0.8595950572279947, 'iou_lcc': 0.8277702894438138, 'dice_lcc': 0.9072091686101725, 'iou': 0.7537630055676184, 'dice': 0.8595950572279947, 'dlr': 0.802582257392753, 'dbr': 0.7969348659003831, 'precision': 0.9335779865307777, 'leakage': 0.06277291547552478, 'amr': 0.11771099704073235}
+Testing DataLoader 0:  95%|█████████▌| 42/44 [1:05:46<03:07,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 493, 247, 410])
+  Image shape: torch.Size([1, 493, 247, 410])
+  Lung shape: torch.Size([1, 493, 247, 410])
+DEBUG eval_metrics[ATM_702_0000.npy]: Found 684 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=611: volume=132607, IoU=0.8555SELECTED
+  - label=21: volume=3446, IoU=0.0000
+  - label=339: volume=1533, IoU=0.0000
+  - label=18: volume=829, IoU=0.0000
+  - label=629: volume=520, IoU=0.0025
+  - label=620: volume=342, IoU=0.0014
+  - label=625: volume=256, IoU=0.0013
+  - label=632: volume=233, IoU=0.0000
+  - label=633: volume=198, IoU=0.0012
+  - label=647: volume=175, IoU=0.0008
+DEBUG eval_metrics: Selected component label=611 with IoU=0.8555 (volume=132607), analysis completed in 99.901s
+DEBUG eval_metrics: num_branch=208, median_branch_len=14.5
+DEBUG eval_metrics: DLR=0.8309, DBR=0.8029 (detected 167/208 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_702_0000.npy: {'iou_full': 0.8176863174112027, 'dice_full': 0.8997001403143897, 'iou_lcc': 0.8554847035082059, 'dice_lcc': 0.9224414020606356, 'iou': 0.8176863174112027, 'dice': 0.8997001403143897, 'dlr': 0.8308781869688385, 'dbr': 0.8028846153846154, 'precision': 0.9399045889259848, 'leakage': 0.057903030215012384, 'amr': 0.09438469861233144}
+Testing DataLoader 0:  98%|█████████▊| 43/44 [1:07:49<01:34,  0.01it/s]Using test ROI size: (128, 128, 128)
+
+[DEBUG] Processing item 0:
+  Prediction shape before inversion: torch.Size([1, 485, 218, 398])
+  Image shape: torch.Size([1, 485, 218, 398])
+  Lung shape: torch.Size([1, 485, 218, 398])
+DEBUG eval_metrics[ATM_703_0000.npy]: Found 1423 connected components in prediction.
+DEBUG eval_metrics: Top 10 components by volume:
+  - label=1353: volume=130901, IoU=0.8070SELECTED
+  - label=1286: volume=9590, IoU=0.0000
+  - label=407: volume=1640, IoU=0.0000
+  - label=1377: volume=781, IoU=0.0040
+  - label=1372: volume=176, IoU=0.0008
+  - label=1405: volume=144, IoU=0.0006
+  - label=1369: volume=125, IoU=0.0004
+  - label=1354: volume=119, IoU=0.0000
+  - label=1423: volume=111, IoU=0.0000
+  - label=1392: volume=111, IoU=0.0006
+DEBUG eval_metrics: Selected component label=1353 with IoU=0.8070 (volume=130901), analysis completed in 148.854s
+DEBUG eval_metrics: num_branch=271, median_branch_len=15.0
+DEBUG eval_metrics: DLR=0.8552, DBR=0.8266 (detected 224/271 branches with min_hit_vox=1, step_mm=1.000)
+Metrics for ATM_703_0000.npy: {'iou_full': 0.7370015021563212, 'dice_full': 0.8485905179027241, 'iou_lcc': 0.8069645071555451, 'dice_lcc': 0.8982556422072551, 'iou': 0.7370015021563212, 'dice': 0.8485905179027241, 'dlr': 0.8551681452444811, 'dbr': 0.8265682656826568, 'precision': 0.9204358848234894, 'leakage': 0.07581974601755234, 'amr': 0.12288077536038537}
+Testing DataLoader 0: 100%|██████████| 44/44 [1:10:37<00:00,  0.01it/s]/vol/bitbucket/ss2424/project/seg_template/project/lib/python3.12/site-packages/pytorch_lightning/core/module.py:512: You called `self.log('avg_test_iou_full', ..., logger=True)` but have no logger configured. You can enable one by doing `Trainer(logger=ALogger(...))`
+/vol/bitbucket/ss2424/project/seg_template/project/lib/python3.12/site-packages/pytorch_lightning/core/module.py:512: You called `self.log('avg_test_dice_full', ..., logger=True)` but have no logger configured. You can enable one by doing `Trainer(logger=ALogger(...))`
+/vol/bitbucket/ss2424/project/seg_template/project/lib/python3.12/site-packages/pytorch_lightning/core/module.py:512: You called `self.log('avg_test_iou_lcc', ..., logger=True)` but have no logger configured. You can enable one by doing `Trainer(logger=ALogger(...))`
+/vol/bitbucket/ss2424/project/seg_template/project/lib/python3.12/site-packages/pytorch_lightning/core/module.py:512: You called `self.log('avg_test_dice_lcc', ..., logger=True)` but have no logger configured. You can enable one by doing `Trainer(logger=ALogger(...))`
+/vol/bitbucket/ss2424/project/seg_template/project/lib/python3.12/site-packages/pytorch_lightning/core/module.py:512: You called `self.log('avg_test_iou', ..., logger=True)` but have no logger configured. You can enable one by doing `Trainer(logger=ALogger(...))`
+/vol/bitbucket/ss2424/project/seg_template/project/lib/python3.12/site-packages/pytorch_lightning/core/module.py:512: You called `self.log('avg_test_dice', ..., logger=True)` but have no logger configured. You can enable one by doing `Trainer(logger=ALogger(...))`
+/vol/bitbucket/ss2424/project/seg_template/project/lib/python3.12/site-packages/pytorch_lightning/core/module.py:512: You called `self.log('avg_test_dlr', ..., logger=True)` but have no logger configured. You can enable one by doing `Trainer(logger=ALogger(...))`
+/vol/bitbucket/ss2424/project/seg_template/project/lib/python3.12/site-packages/pytorch_lightning/core/module.py:512: You called `self.log('avg_test_dbr', ..., logger=True)` but have no logger configured. You can enable one by doing `Trainer(logger=ALogger(...))`
+/vol/bitbucket/ss2424/project/seg_template/project/lib/python3.12/site-packages/pytorch_lightning/core/module.py:512: You called `self.log('avg_test_precision', ..., logger=True)` but have no logger configured. You can enable one by doing `Trainer(logger=ALogger(...))`
+/vol/bitbucket/ss2424/project/seg_template/project/lib/python3.12/site-packages/pytorch_lightning/core/module.py:512: You called `self.log('avg_test_leakage', ..., logger=True)` but have no logger configured. You can enable one by doing `Trainer(logger=ALogger(...))`
+/vol/bitbucket/ss2424/project/seg_template/project/lib/python3.12/site-packages/pytorch_lightning/core/module.py:512: You called `self.log('avg_test_amr', ..., logger=True)` but have no logger configured. You can enable one by doing `Trainer(logger=ALogger(...))`
+/vol/bitbucket/ss2424/project/seg_template/project/lib/python3.12/site-packages/pytorch_lightning/core/module.py:512: You called `self.log('avg_test_dice_loss', ..., logger=True)` but have no logger configured. You can enable one by doing `Trainer(logger=ALogger(...))`
+Detailed per-case test metrics saved to ./outputs/DiceCEPlusSoftclDice_ATM22_9_11_0_AttentionUNet_prtrFalse_AdamW_128_b1_p4_0.0001_alpha0.3_r_d1.0r_l0.7WarmupCosineSchedule/detailed_test_metrics.json
+Final aggregated test metrics saved to ./outputs/DiceCEPlusSoftclDice_ATM22_9_11_0_AttentionUNet_prtrFalse_AdamW_128_b1_p4_0.0001_alpha0.3_r_d1.0r_l0.7WarmupCosineSchedule/final_test_metrics.json
+Testing DataLoader 0: 100%|██████████| 44/44 [1:10:37<00:00,  0.01it/s]
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+       Test metric             DataLoader 0
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+      avg_test_amr          0.14325059950351715
+      avg_test_dbr          0.7460882663726807
+      avg_test_dice         0.8684844970703125
+   avg_test_dice_full       0.8684844970703125
+    avg_test_dice_lcc       0.8930820822715759
+   avg_test_dice_loss       0.1315154880285263
+      avg_test_dlr          0.7682844400405884
+      avg_test_iou          0.7693665027618408
+    avg_test_iou_full       0.7693665027618408
+    avg_test_iou_lcc         0.804549515247345
+    avg_test_leakage       0.060307689011096954
+   avg_test_precision       0.9345372319221497
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Testing completed!
+Final aggregated test results saved to: ./outputs/DiceCEPlusSoftclDice_ATM22_9_11_0_AttentionUNet_prtrFalse_AdamW_128_b1_p4_0.0001_alpha0.3_r_d1.0r_l0.7WarmupCosineSchedule/final_test_metrics.json
+------------------------------------------------------------
+Test run finished with exit code: 0
+Final memory usage:                total        used        free      shared  buff/cache   available
+Mem:            62Gi       2.4Gi       9.8Gi        55Mi        51Gi        60Gi
+Swap:          4.0Gi        64Mi       3.9Gi
+Job finished at: Sat 13 Sep 13:44:30 BST 2025
+------------------------------------------------------------

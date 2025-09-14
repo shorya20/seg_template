@@ -17,7 +17,6 @@ from monai.utils import convert_to_numpy, convert_to_tensor
 
 
 def _spacing_direction_origin_from_affine(aff):
-    # Ensure aff is a NumPy array before processing
     if isinstance(aff, torch.Tensor):
         aff = aff.cpu().numpy()
     

@@ -2,12 +2,31 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from monai.losses import DiceLoss, FocalLoss
+from monai.losses import DiceLoss, FocalLoss, DiceCELoss
+from monai.losses import SoftclDiceLoss as MONAI_SoftclDiceLoss
+from monai.losses import SoftDiceclDiceLoss as MONAI_SoftDiceclDiceLoss
 from monai.networks.utils import one_hot
 from monai.utils import LossReduction
 import numpy as np
 from scipy.ndimage import distance_transform_edt
 from typing import List, Optional, Tuple, Union
+
+#helper function as MONAI's SoftclDiceLoss and SoftDiceclDiceLoss expects two channels (background and foreground) input as probabilities.
+def _to_two_channel_probs(logits: torch.Tensor, target: torch.Tensor):
+    """
+    Convert single-channel logits & binary target to 2-channel probabilities and 2-channel targets.
+    logits: (B,1,Z,Y,X), target: (B,1,Z,Y,X) in {0,1}
+    Returns y_true_2c, y_pred_2c in float32 for stability.
+    """
+    p = torch.sigmoid(logits)                       # (B,1,.,.,.)
+    if target.shape[1] == 1:
+        tgt_fg = target
+    else:  # if one-hot came in, assume last channel is fg
+        tgt_fg = target[:, -1:, ...]
+    y_pred_2c = torch.cat([1.0 - p, p], dim=1).float()
+    y_true_2c = torch.cat([1.0 - tgt_fg, tgt_fg], dim=1).float()
+    return y_true_2c, y_pred_2c
+
 
 #helper function to calculate the soft skeletonization
 def soft_skeletonize(x, thresh_width=10):
@@ -129,7 +148,69 @@ class HardclDiceLoss(nn.Module):
         
         cl_dice /= target.shape[0]
         return (1.0 - self.alpha) * dice + self.alpha * cl_dice
-    
+
+class SoftclDiceAdapter(nn.Module):
+    """
+    Adapter around MONAI SoftclDiceLoss for binary (1-channel logit) outputs.
+    """
+    def __init__(self, iter_: int = 3, smooth: float = 1.0):
+        super().__init__()
+        self.loss = MONAI_SoftclDiceLoss(iter_=iter_, smooth=smooth)
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        y_true_2c, y_pred_2c = _to_two_channel_probs(logits, target)
+        # MONAI's SoftclDiceLoss expects forward(y_true, y_pred)
+        return self.loss(y_true_2c, y_pred_2c)
+
+class SoftDiceclDiceAdapter(nn.Module):
+    """
+    Adapter around MONAI SoftDiceclDiceLoss (soft dice + clDice inside MONAI).
+    """
+    def __init__(self, iter_: int = 3, alpha: float = 0.5, smooth: float = 1.0):
+        super().__init__()
+        self.loss = MONAI_SoftDiceclDiceLoss(iter_=iter_, alpha=alpha, smooth=smooth)
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        y_true_2c, y_pred_2c = _to_two_channel_probs(logits, target)
+        return self.loss(y_true_2c, y_pred_2c)
+
+class DiceCEPlusSoftclDice(nn.Module):
+    """
+    Composite: DiceCE(logits, target) + cl_weight * SoftclDice(probs_2c, target_2c).
+    Use this as your main 'DiceCE + softCLDice' improvement.
+    """
+    def __init__(
+        self,
+        include_background: bool = False,
+        to_onehot_y: bool = False,
+        sigmoid: bool = True,
+        softmax: bool = False,
+        lambda_dice: float = 1.0,
+        lambda_ce: float = 0.5,
+        cl_weight: float = 0.3,
+        cl_iter: int = 3,
+        cl_smooth: float = 1.0,
+    ):
+        super().__init__()
+        self.dicece = DiceCELoss(
+            include_background=include_background,
+            to_onehot_y=to_onehot_y,
+            sigmoid=sigmoid,
+            softmax=softmax,
+            lambda_dice=lambda_dice,
+            lambda_ce=lambda_ce,
+        )
+        self.cldice = MONAI_SoftclDiceLoss(iter_=cl_iter, smooth=cl_smooth)
+        self.cl_weight = float(cl_weight)
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # DiceCE on logits (BCEWithLogits inside, Dice on sigmoid probs) — safe & standard
+        loss_dicece = self.dicece(logits, target)
+        # clDice on 2-channel probabilities
+        y_true_2c, y_pred_2c = _to_two_channel_probs(logits, target)
+        loss_cldice = self.cldice(y_true_2c, y_pred_2c)
+        return loss_dicece + self.cl_weight * loss_cldice
+
 class GeneralUnionLoss(nn.Module):
     """
     GeneralUnionLoss: A class that implements the Generalized Union loss function 

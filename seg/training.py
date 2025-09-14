@@ -16,8 +16,12 @@ import monai
 import copy as cp
 from callbacks import SmartCacheCallback
 from .force_gpu import (force_cuda_device, diagnose_model_placement, verify_tensor_on_gpu, force_model_to_gpu, monitor_gpu_usage)
-from .utils import (find_file_in_path, get_model, get_loss, get_optimizer, get_metric, get_scheduler,
-                   get_folder_names, save_val_2path, get_lcc)
+from .utils import (
+    weighted_sliding_window_inference, load_patch_bank_for_case,
+    extract_case_id_from_meta, make_audit_weight_provider,
+    make_landmark_weight_provider_from_bank, get_model, get_loss, get_optimizer, get_scheduler, save_to_check, test_memory_inference, test_memory_training,
+    get_lcc, save_val_2path, get_folder_names, find_file_in_path, save_one_hot_encoding, get_metric
+)
 from .DataModule import SegmentationDataModule
 from .metrics import AirwayMetrics
 from .topo_metrics import compute_binary_iou, evaluation_branch_metrics
@@ -83,31 +87,17 @@ from tqdm import tqdm
 from scipy.ndimage import zoom
 import scipy.ndimage
 from scipy.ndimage import binary_erosion, label as ndimg_label
-
-# Added import for SimpleResUNet with absolute path
 from models.SimpleResUNet import SimpleResUNet
 from monai.transforms.transform import MapTransform
 from .transforms import DebugMetadatad
-from .custom_save import SaveImageWithOriginalMetadatad
-
-# Fix for PyTorch 2.6 weights_only issue with MONAI PersistentDataset
-# This monkey patch allows MONAI objects to be loaded safely
+from .custom_save import SaveImageWithOriginalMetadatady
 import torch.serialization
 from monai.utils.enums import LazyAttr
 from .DataModule import LoadOriginalNiftiHeaderd
-
-# Add MONAI's LazyAttr to safe globals for torch.load
 torch.serialization.add_safe_globals([LazyAttr])
-
-# Store original torch.load function
 _original_torch_load = torch.load
 
 def _patched_torch_load(f, map_location=None, pickle_module=None, weights_only=None, **kwargs):
-    """
-    Patched version of torch.load that handles MONAI compatibility with PyTorch 2.6+
-    """
-    # If weights_only is not explicitly set and we're loading from a file that might contain MONAI objects,
-    # set weights_only=False for backward compatibility
     if weights_only is None:
         # Check if this looks like a MONAI cache file
         if hasattr(f, 'name') and isinstance(f.name, str):
@@ -125,15 +115,17 @@ def _patched_torch_load(f, map_location=None, pickle_module=None, weights_only=N
 torch.load = _patched_torch_load
 
 try:
-    mp.set_start_method('fork', force=True)
-    print("Set multiprocessing start method to 'fork'")
+    # 'spawn' is the safest choice with CUDA; avoids deadlocks seen with 'fork'
+    mp.set_start_method('spawn', force=True)
+    print("Set multiprocessing start method to 'spawn'")
 except RuntimeError:
     # already set
-    pass
+    current = mp.get_start_method(allow_none=True)
+    print(f"Multiprocessing start method already set to '{current}'")
 
 # Get current limits
 rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
-torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.benchmark = False
 # more reasonable value or use the existing hard limit
 try:
     new_soft_limit = min(131072, rlimit[1])
@@ -146,7 +138,7 @@ torch.set_float32_matmul_precision('high')
 pl.seed_everything(42, workers=True)
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="The airway segmentation on AIIB23")
+    parser = argparse.ArgumentParser(description="The airway segmentation on ATM22")
     parser.add_argument("--max_time_hours", type=int, default=int(os.getenv('MAX_TIME_HOURS', '120')))
     # patch size - for now static
     parser.add_argument("--patch_size", type=int, default=int(os.getenv('PATCH_SIZE', 192)), help="Minimum pixel value")
@@ -156,7 +148,7 @@ def parse_args():
     parser.add_argument("--mixed", action="store_true", help="run with mixed precision training")
     # Voxel values - for now static
     parser.add_argument("--pixel_value_min", type=int, default=float(os.getenv('PIXEL_VALUE_MIN', '-1000')), help="Minimum pixel value")
-    parser.add_argument("--pixel_value_max", type=int, default=float(os.getenv('PIXEL_VALUE_MAX', '400')), help="Maximum pixel value")
+    parser.add_argument("--pixel_value_max", type=int, default=float(os.getenv('PIXEL_VALUE_MAX', '600')), help="Maximum pixel value")
     parser.add_argument("--pixel_norm_min", type=float, default=float(os.getenv('PIXEL_NORM_MIN', '0.0')), help="Minimum normalized pixel value")
     parser.add_argument("--pixel_norm_max", type=float, default=float(os.getenv('PIXEL_NORM_MAX', '1.0')), help="Maximum normalized pixel value")
     # Model Hyperparameters - static for the moment
@@ -203,7 +195,7 @@ def parse_args():
     # File paths
     parser.add_argument("--exp_path", type=str, default="", help="The experiment path")
     parser.add_argument("--weights_path", type=str, default="", help="The best model weight path")
-    parser.add_argument("--dataset", type=str, default="AIIB23", help="The DATASET to use")
+    parser.add_argument("--dataset", type=str, default="ATM22", help="The DATASET to use")
     parser.add_argument("--weights_dir", type=str, default="Wr1alpha0.2", help="The weight map of mgul path")
 
     # Adaptive weight change AWC
@@ -215,6 +207,7 @@ def parse_args():
     parser.add_argument("--cache_dataset", action="store_true", default=False, help="Caching dataset or not")
     parser.add_argument("--save_val", action="store_true", default=False, help="Caching dataset or not")
     parser.add_argument("--print_val_stats", action="store_true", default=False, help="Print additional validation statistics")
+    parser.add_argument("--pred_threshold", type=float, default=float(os.getenv('PRED_THRESHOLD', '0.5')), help="Probability threshold for binarizing predictions")
 
     # Phase of the experiment
     parser.add_argument("--training", action="store_true", help="Run training phase")
@@ -233,10 +226,10 @@ def parse_args():
         default="",
         help="Path to checkpoint to fine-tune from (loads weights only, re-inits optimizer/scheduler)",
     )
-
     args = parser.parse_args()
     args.use_pretrained = args.weights_path != ""
     args.one_hot = False
+    args.mixed = True
     args.weights_dir = "Wr1alpha0.2" 
     args.max_cardinality = 120 if args.dataset == "AIIB23" else 200
     if args.dataset == "AeroPath":
@@ -257,14 +250,9 @@ month = now.month
 
 # fixes the max_pool3d_with_indices_backward_cuda deterministic error
 try:
-    # First, try to allow non-deterministic algorithms for specific operations that don't have
-    # deterministic CUDA implementations (like max_pool3d_with_indices_backward)
     import os
     os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':16:8'
-    
-    # Set deterministic algorithms with warn_only=True
-    torch.use_deterministic_algorithms(True, warn_only=True)
-    
+    torch.use_deterministic_algorithms(True, warn_only=True)    
     # MONAI's set_determinism - this will set seeds and some deterministic behaviors
     set_determinism(seed=42)
     print("Using deterministic algorithms with fallback for non-deterministic CUDA operations")
@@ -275,7 +263,6 @@ except Exception as e:
     torch.manual_seed(42)
     np.random.seed(42)
     random.seed(42)
-    
     # Explicitly disable deterministic algorithms to avoid CUDA errors
     torch.use_deterministic_algorithms(False)
     print("Using non-deterministic algorithms for compatibility with CUDA operations")
@@ -299,7 +286,6 @@ params_dict = {
     'PIXEL_VALUE_MAX': int(os.getenv('PIXEL_VALUE_MAX', args.pixel_value_max)),
     'PIXEL_NORM_MIN': float(os.getenv('PIXEL_NORM_MIN', args.pixel_norm_min)),
     'PIXEL_NORM_MAX': float(os.getenv('PIXEL_NORM_MAX', args.pixel_norm_max)),
-    # 'VOXEL_SIZE': tuple(args.voxel_size),  # args.voxel_size is already [x, y, z], just convert to tuple
     'NUM_EPOCHS': args.max_epochs,
     'CACHE_DATASET': True if args.cache_dataset else False,
     'SMARTCACHE': args.smartcache,
@@ -307,7 +293,6 @@ params_dict = {
     'SMARTCACHE_INIT_WORKERS_FACTOR': float(os.getenv('SMARTCACHE_INIT_WORKERS_FACTOR', '0.5')),
     'SMARTCACHE_REPLACE_WORKERS_FACTOR': float(os.getenv('SMARTCACHE_REPLACE_WORKERS_FACTOR', '0.5')),
     'CACHE_RATE': args.cache_rate if hasattr(args, 'cache_rate') else float(os.getenv('CACHE_RATE', '1.0')),
-    # Enable disk-backed caching by default to avoid RAM OOM
     'PERSISTENT_DATASET': os.getenv('PERSISTENT_DATASET', 'True').lower() == 'true',
     'AVAILABLE_GPUs': torch.cuda.device_count(),
     'DEVICE_NO': int(os.getenv('DEVICE_NO', '0')),
@@ -338,8 +323,11 @@ params_dict = {
     'USE_PATCH_BANK_SAMPLING': bool(os.getenv('USE_PATCH_BANK_SAMPLING', 'True').lower() == 'true'),
     'PATCH_BANKS_DIR': os.getenv('PATCH_BANKS_DIR', './ATM22/npy_files/patch_banks/'),
     'SAMPLER_POS_RATIO': float(os.getenv('SAMPLER_POS_RATIO', '0.9')),
-    'SAMPLER_TEMPERATURE': float(os.getenv('SAMPLER_TEMPERATURE', '1.0')),
-    'SAMPLER_FG_THRESHOLD': float(os.getenv('SAMPLER_FG_THRESHOLD', '4.72e-05')),
+    'SAMPLER_TEMPERATURE': float(os.getenv('SAMPLER_TEMPERATURE', '0.8')),
+    'SAMPLER_FG_THRESHOLD': float(os.getenv('SAMPLER_FG_THRESHOLD', '4.768e-05')),
+    'SAMPLER_USE_LANDMARKS': bool(os.getenv('SAMPLER_USE_LANDMARKS', 'False').lower() == 'true'),
+    'SAMPLER_QUOTA_BIFURCATION': float(os.getenv('SAMPLER_QUOTA_BIFURCATION', '0.0')),
+    'SAMPLER_QUOTA_TRACHEA': float(os.getenv('SAMPLER_QUOTA_TRACHEA', '0.0')),
 }
 
 # Update params dict with SmartCache settings if enabled
@@ -374,8 +362,6 @@ if params_dict['VALIDATION_PHASE'] or params_dict['TEST_PHASE']:
     output_path = os.getenv('OUTPUT_PATH', './outputs/') + args.exp_path
 else:
     output_path = os.getenv('OUTPUT_PATH', './outputs/') + exp_path
-
-# Always ensure the output directory exists, regardless of the phase
     os.makedirs(output_path, exist_ok=True)
 
 if params_dict['TRAINING_PHASE']:
@@ -387,13 +373,12 @@ if params_dict['TRAINING_PHASE']:
     os.makedirs(output_path + "/visualization/", exist_ok=True)
     os.makedirs(output_path + "/AWC_STEP/", exist_ok=True)
 
-# For testing/validation, create the necessary directories
 if params_dict['TEST_PHASE'] or params_dict['VALIDATION_PHASE']:
     os.makedirs(output_path + "/preds/", exist_ok=True)
     if args.debug_inference:
         os.makedirs(output_path + "/debug_preds/", exist_ok=True)
 
-# Correctly determine dataset_path to be passed to DataModule
+
 data_path_for_datamodule = os.getenv('DATASET_PATH', './ATM22/npy_files/') # Directly use or default
 
 if not os.path.isdir(data_path_for_datamodule):
@@ -416,7 +401,7 @@ data_module = SegmentationDataModule(
     args=args
 )
 
-# Save the arguments to a JSON file
+# Saved parameters to JSON for reproducibility
 with open(output_path+"/params.json", 'w') as json_file:
     json.dump(params_dict, json_file, indent=2)
 csv_file = output_path + "/results.csv"
@@ -437,7 +422,7 @@ model_params = {
     'WEIGHTS_PATH': args.weights_path,
     'TRAINING_PHASE': args.training  # Add training phase flag
 }
-# Save the arguments to a JSON file
+# Saved the arguments to a JSON file
 with open(output_path+"/model_params.json", 'w') as json_file:
     json.dump(model_params, json_file, indent=2)
 
@@ -489,15 +474,17 @@ class SegmentationNet(pl.LightningModule):
         # Initialize post-processing transforms
         self.post_pred_val = Compose([
             Activationsd(keys="pred", sigmoid=True),
-            AsDiscreted(keys="pred", threshold=0.5)
+            AsDiscreted(keys="pred", threshold=float(os.getenv('PRED_THRESHOLD', args.pred_threshold)))
         ])
+        # Use same post-processing for test and sc to ensure consistency
         self.post_pred_test = Compose([
             Activationsd(keys="pred", sigmoid=True),
-            AsDiscreted(keys="pred", threshold=0.5)
+            AsDiscreted(keys="pred", threshold=float(os.getenv('PRED_THRESHOLD', args.pred_threshold)))
         ])
+        #Here sc is for sliding window inference during validation
         self.post_pred_sc = Compose([
             Activationsd(keys="pred", sigmoid=True),
-            AsDiscreted(keys="pred", threshold=0.5)
+            AsDiscreted(keys="pred", threshold=float(os.getenv('PRED_THRESHOLD', args.pred_threshold)))
         ])
         # The inverter will be initialized in `on_test_start`
         self.inverter = None
@@ -506,7 +493,15 @@ class SegmentationNet(pl.LightningModule):
         self.test_step_outputs = []
         
         # Initialize loss function (foreground only for binary segmentation)
-        self.loss_function = get_loss(args.loss_func, include_background=False)
+        # Loss configuration with optional env overrides for composite losses
+        self.loss_params = {}
+        if args.loss_func == 'DiceCELoss':
+            try:
+                self.loss_params["lambda_dice"] = float(os.getenv('DICECE_LAMBDA_DICE', '1.0'))
+                self.loss_params["lambda_ce"] = float(os.getenv('DICECE_LAMBDA_CE', '0.5'))
+            except Exception:
+                self.loss_params = {"lambda_dice": 1.0, "lambda_ce": 0.5}
+        self.loss_function = get_loss(args.loss_func, params=self.loss_params, include_background=False)
         
         
         # Memory optimization
@@ -591,11 +586,11 @@ class SegmentationNet(pl.LightningModule):
 
     def test_dataloader(self):
         if args.metric_testing:
-            # For metric testing, use the dataloader WITH LABELS (from the validation split of the training set)
+            # For metric testing, use the dataloader with ground-truth labels (from the validation split of the training set)
             print("Metric testing enabled: using validation dataloader with labels.")
             return self.data_module.aff_training_val_dataloader()
         else:
-            # For inference, use the dataloader without labels
+            # For inference, use the dataloader without labels (official validation set)
             print("Inference mode: using official test dataloader (no labels).")
             return self.data_module.off_test_dataloader()
 
@@ -776,8 +771,6 @@ class SegmentationNet(pl.LightningModule):
                         # and also considers if it's followed by a known metric like '-iou' or '-dice'
                         # Example: model-epoch_44-iou_0.2112.ckpt, model_epoch_44_dice_0.000.ckpt
                         # More general: Look for 'epoch_NUM' or '-NUM-' where NUM is likely an epoch
-                        # Updated regex to be more general
-                        # Handles cases like: "epoch=X-", "epoch=X.ckpt", "_X-", "-X."
                         specific_patterns = [
                             r"epoch=(\d+)[-_.]",          
                             r"epoch_(\d+)[-_.]",         
@@ -798,7 +791,6 @@ class SegmentationNet(pl.LightningModule):
                             
                             if potential_epochs:
                                 # Filter out numbers that look like metric values (e.g., have many digits or are small)
-                                # This is heuristic; assumes epochs are usually <10000 and not 0-padded for metrics
                                 valid_epochs = [p for p in potential_epochs if len(p) < 5 and not (len(p) > 1 and p.startswith('0'))] 
                                 if valid_epochs:
                                      epoch_num_str = valid_epochs[-1] # Take the last plausible one
@@ -833,13 +825,12 @@ class SegmentationNet(pl.LightningModule):
                     # This case indicates self.csv_logger_file might be a path string or something else
                     print(f"Warning: self.csv_logger_file (type: {type(self.csv_logger_file)}) does not have a callable 'close' method.")
             
-            # Correctly close self.csv_file_handle which was opened in on_train_start
             if hasattr(self, 'csv_file_handle') and self.csv_file_handle is not None: 
                 try:
                     if hasattr(self.csv_file_handle, 'close') and callable(self.csv_file_handle.close):
                         self.csv_file_handle.close() 
                         print("Epoch metrics CSV file (csv_file_handle) closed.")
-                        self.csv_file_handle = None # Good practice to nullify after closing
+                        self.csv_file_handle = None 
                     else:
                         print(f"Warning: self.csv_file_handle (type: {type(self.csv_file_handle)}) does not have a callable 'close' method.")
                 except Exception as e:
@@ -850,16 +841,12 @@ class SegmentationNet(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         self.batch_count += 1
-        # Only clear memory every 100 batches instead of 30 to reduce overhead
         if batch_idx % 100 == 0:
             self._clear_memory()
         loss = None
         try:
-            # Move inputs and labels to GPU with non_blocking=True for better parallelism
             inputs = batch["image"].to(self._device, non_blocking=True)
             labels = batch["label"].to(self._device, non_blocking=True)
-            
-            # Reduce debug tensor checks to improve performance 
             if batch_idx == 0:
                 if not verify_tensor_on_gpu(inputs, "Input batch"):
                     print("Input batch was on CPU! Moving to GPU...")
@@ -868,71 +855,59 @@ class SegmentationNet(pl.LightningModule):
                     print("Label batch was on CPU! Moving to GPU...")
                     labels = labels.to(self._device)
             
-            # Reduce console output - only print shapes occasionally
             if batch_idx == 0 or batch_idx % 50 == 0:
                 print(f"Training - Input Shape: {inputs.shape}, Label Shape: {labels.shape}")
-
-            # Check for empty labels
             label_sum = torch.sum(labels > 0).item()
             bg_only_batch = (label_sum == 0)
             if bg_only_batch and (batch_idx == 0 or batch_idx % 50 == 0):
-                print(f"INFO: Batch {batch_idx} has no positive labels. Using background-only BCE loss.")
-                
-            # Only load additional data (lungs, weights) if needed by the loss function
+                print(f"INFO: Batch {batch_idx} has no positive labels. Using background-only BCE loss.")               
+
             if args.loss_func in ['GUL', 'BEL', 'CBEL']:
                 lungs = batch["lung"].to(self._device, non_blocking=True) if "lung" in batch else None
                 weights = batch["weight"].to(self._device, non_blocking=True) if "weight" in batch else None
 
-            # Automatic mixed precision forward pass
+
             with amp.autocast(enabled=args.mixed, dtype=torch.float16, device_type=self.device_type):
                 if self._model.__class__.__name__ == 'SimpleResUNet' and self.training:
                     logits = self.forward(inputs)
                 else:
                     logits = self.forward(inputs)
-                
-                # Print model output shape less frequently
+            
                 if batch_idx == 0 or batch_idx % 50 == 0:
                     print(f"Training - Model Output Shape: {logits.shape}")
-                
-                # Calculate loss
-                if bg_only_batch:
-                    # Background-only supervision: penalize any false positives robustly
-                    bce_loss_fn = nn.BCEWithLogitsLoss(reduction="mean")
-                    zeros = torch.zeros_like(labels, dtype=logits.dtype)
-                    loss = bce_loss_fn(logits.float(), zeros.float())
-                else:
-                    # Calculate loss based on the loss function type
-                    if args.loss_func == 'GUL' or args.loss_func == 'BEL':
-                        if weights is None:
-                            raise ValueError(f"Loss function {args.loss_func} requires 'weight' in batch but it was not found.")
-                        # For custom loss functions that take weights, pass them as keyword args
-                        try:
-                            loss = self.loss_function(logits.float(), labels.float(), weight_map=weights)
-                        except TypeError:
-                            # Fallback to standard 2-argument call if weight parameter isn't supported
-                            loss = self.loss_function(logits.float(), labels.float())
-                    elif args.loss_func == 'CBEL':
-                        if weights is None:
-                            raise ValueError(f"Loss function {args.loss_func} requires 'weight' in batch but it was not found.")
-                        if lungs is None:
-                            raise ValueError(f"Loss function {args.loss_func} requires 'lung' in batch but it was not found.")
-                        # For custom loss functions that take weights and lungs, pass them as keyword args
-                        try:
-                            loss = self.loss_function(logits.float(), labels.float(), weight_map=weights, lung_mask=lungs)
-                        except TypeError:
-                            # Fallback to standard 2-argument call if parameters aren't supported
-                            loss = self.loss_function(logits.float(), labels.float())
-                    else:
+            
+                labels = labels.to(dtype=logits.dtype)
+            # Calculate loss
+            if bg_only_batch:
+                # Background-only supervision: penalize any false positives robustly
+                bce_loss_fn = nn.BCEWithLogitsLoss(reduction="mean")
+                zeros = torch.zeros_like(labels, dtype=logits.dtype)
+                loss = bce_loss_fn(logits, zeros)
+            else:
+                # Calculate loss based on the loss function type
+                if args.loss_func == 'GUL' or args.loss_func == 'BEL':
+                    if weights is None:
+                        raise ValueError(f"Loss function {args.loss_func} requires 'weight' in batch but it was not found.")
+                    # For custom loss functions that take weights, pass them as keyword args
+                    try:
+                        loss = self.loss_function(logits.float(), labels.float(), weight_map=weights)
+                    except TypeError:
+                        # Fallback to standard 2-argument call if weight parameter isn't supported
                         loss = self.loss_function(logits.float(), labels.float())
-            
-            # Safeguard against extreme loss values that could destabilize training
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"WARNING: NaN/Inf loss detected at batch {batch_idx}. Replacing with 1.0")
-                loss = torch.tensor(1.0, device=self._device, requires_grad=True)
-            elif loss > 10.0:  # Clamp extremely high losses
-                print(f"WARNING: Extreme loss {loss.item():.4f} at batch {batch_idx}. Clamping to 10.0")
-                loss = torch.clamp(loss, max=10.0)
-            
+                elif args.loss_func == 'CBEL':
+                    if weights is None:
+                        raise ValueError(f"Loss function {args.loss_func} requires 'weight' in batch but it was not found.")
+                    if lungs is None:
+                        raise ValueError(f"Loss function {args.loss_func} requires 'lung' in batch but it was not found.")
+                    # For custom loss functions that take weights and lungs, pass them as keyword args
+                    try:
+                        loss = self.loss_function(logits.float(), labels.float(), weight_map=weights, lung_mask=lungs)
+                    except TypeError:
+                        # Fallback to standard 2-argument call if parameters aren't supported
+                        loss = self.loss_function(logits.float(), labels.float())
+                else:
+                    loss = self.loss_function(logits.float(), labels.float())
+        
             # Less frequent memory usage reports to reduce overhead
             if batch_idx % 10 == 0:
                 memory_usage = torch.cuda.memory_allocated() / 1024**3
@@ -942,13 +917,12 @@ class SegmentationNet(pl.LightningModule):
             current_loss_val = loss.item()
             self.log("train_loss", current_loss_val, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=False, batch_size=args.batch_size)
             
-            if current_loss_val < 0.001 or current_loss_val > 0.999:
-                print(f"WARNING: Epoch {self.current_epoch}, Batch {batch_idx}: Extreme train_loss_step: {current_loss_val:.4f}")
-                print(f"         Input shape: {inputs.shape}, Label shape: {labels.shape}")
-                print(f"         Label sum: {torch.sum(labels).item()}, Label non-zero: {torch.count_nonzero(labels).item()}")
-                if logits is not None:
-                    print(f"         Logits min: {torch.min(logits).item():.4f}, max: {torch.max(logits).item():.4f}, mean: {torch.mean(logits).item():.4f}")
-
+            upper_warn = 0.999
+            if args.loss_func.lower().startswith("dicece"):
+                # CE starts ~0.55–0.70; with lambda_ce (default 0.5), upper bound ≈ 1 + 0.5*0.70 = 1.35
+                upper_warn = 1.0 + self.loss_params.get("lambda_ce", 0.5) * 0.70
+            if current_loss_val < 1e-4 or current_loss_val > upper_warn:
+                print("WARNING: Unusual loss value detected:", current_loss_val)
             # Explicitly delete tensors to help with memory management
             del inputs, labels, logits # Ensure logits is deleted
             if args.loss_func in ['GUL', 'BEL', 'CBEL']:
@@ -1011,26 +985,79 @@ class SegmentationNet(pl.LightningModule):
         with torch.no_grad():
             torch.cuda.empty_cache()
             with amp.autocast(enabled=args.mixed, dtype=torch.float16, device_type=self.device_type):
-                val_roi_size = (args.patch_size if args.patch_size is not None else (192, 192, 192)) # Default to 192x192x192 if not set
+                raw_val_roi_size = args.test_patch_size if args.test_patch_size is not None else args.patch_size
+                val_roi_size = (raw_val_roi_size,) * 3 if isinstance(raw_val_roi_size, int) else raw_val_roi_size
                 sw_batch_size = 1
-                overlap = 0.25
-                
-                outputs = sliding_window_inference( # outputs are logits
-                    inputs=val_inputs,
-                    roi_size=val_roi_size,
-                    sw_batch_size=sw_batch_size,
-                    predictor=self.forward,
-                    overlap=0.25,
-                    mode='gaussian',
-                    device=self._device,
-                )
-                
-                if batch_idx % 20 == 0:
-                    print(f"Val batch {batch_idx}: Input {val_inputs.shape}, Output {outputs.shape}")
-                torch.cuda.empty_cache()
+                ovlp = 0.5
+                banks_dir = os.getenv("PATCH_BANKS_DIR", "./ATM22/npy_files/patch_banks")
+                use_weighted = bool(int(os.getenv("USE_WEIGHTED_AGGREGATOR", "1")))
+                mode = os.getenv("CONF_SOURCE", "audit").lower()  # "audit" | "landmarks"
 
-        # Calculate loss using raw logits and original labels (converted to float for loss function)
-        loss_val = self.loss_function(outputs.float(), val_labels.float())
+                if use_weighted:
+                    # case id from meta (consistent with the bank sampler)
+                    case_id = extract_case_id_from_meta(batch.get("image_meta_dict", {}))
+                    patch_list, meta = load_patch_bank_for_case(case_id, banks_dir)
+                    if patch_list:
+                        # build provider
+                        if mode == "landmarks":
+                            # processed spacing if available in meta_dict (optional)
+                            spacing = None
+                            try:
+                                # MONAI MetaTensor sometimes carries pixdim via affine; you can pass None to treat σ as voxels
+                                spacing = None
+                            except Exception:
+                                spacing = None
+                            per_w = make_landmark_weight_provider_from_bank(
+                                patch_list=patch_list,
+                                vol_shape_zyx=tuple(int(v) for v in val_inputs.shape[-3:]),
+                                roi_zyx=tuple(int(v) for v in val_roi_size),
+                                spacing_zyx_mm=spacing,
+                                sigma_mm=float(os.getenv("CONF_SIGMA_MM", "30.0")),
+                            )
+                        else:
+                            per_w = make_audit_weight_provider(
+                                patch_list=patch_list, roi_zyx=tuple(int(v) for v in val_roi_size)
+                            )
+
+                        outputs = weighted_sliding_window_inference(
+                            inputs=val_inputs,
+                            predictor=self.forward,
+                            roi_size=tuple(int(v) for v in val_roi_size),
+                            overlap=ovlp,
+                            per_window_weight=per_w,
+                            device=self._device,
+                            gaussian_blend=True,
+                        )
+                    else:
+                        # Fallback to standard SWI if bank missing
+                        outputs = sliding_window_inference(
+                            inputs=val_inputs,
+                            roi_size=val_roi_size,
+                            sw_batch_size=1,
+                            predictor=self.forward,
+                            overlap=ovlp,
+                            mode="gaussian",
+                            cval=0
+                        )
+                else:
+                    outputs = sliding_window_inference(
+                        inputs=val_inputs,
+                        roi_size=val_roi_size,
+                        sw_batch_size=1,
+                        predictor=self.forward,
+                        overlap=ovlp,
+                        mode="gaussian",
+                        cval=0
+                    )
+                    
+            if batch_idx % 20 == 0:
+                print(f"Val batch {batch_idx}: Input {val_inputs.shape}, Output {outputs.shape}")
+            torch.cuda.empty_cache()
+
+        # Ensure labels match outputs dtype to avoid unnecessary upcasts
+        val_labels = val_labels.to(dtype=outputs.dtype)
+        # Calculate loss using raw outputs and original labels
+        loss_val = self.loss_function(outputs, val_labels)
         self.log('val_loss_step', loss_val) # Log the step loss
 
         # Post-process outputs for metric calculation (sigmoid + threshold)
@@ -1113,9 +1140,6 @@ class SegmentationNet(pl.LightningModule):
         # Aggregate metrics only if there were valid batches processed by the metric objects
         val_dice_epoch = self.val_dice_metric.aggregate().item() if self.valid_batches > 0 else 0.0
         val_iou_epoch = self.val_iou_metric.aggregate().item() if self.valid_batches > 0 else 0.0
-        
-        # Retrieve the epoch-averaged validation loss logged by PL
-        # val_loss is logged in validation_step with on_epoch=True, PL handles averaging.
         val_loss_epoch = self.trainer.logged_metrics.get('val_loss', torch.tensor(0.0)).item()
 
         # Log traditional metrics
@@ -1137,7 +1161,6 @@ class SegmentationNet(pl.LightningModule):
             self.log("val_amr", airway_metrics["amr"].item(), prog_bar=False, logger=True)  # Airway Missing Ratio
             self.airway_metrics.reset()
         else:
-            # If disabled, log zeros to keep logger keys consistent or skip entirely
             pass
         
         # Reset other metrics
@@ -1166,8 +1189,6 @@ class SegmentationNet(pl.LightningModule):
                 print(f"  - {sample_info}")
             if len(self.problematic_samples) > 5:
                 print(f"  ... and {len(self.problematic_samples) - 5} more")
-            
-            # Save list to file for inspection
             problematic_file = os.path.join(output_path, f"problematic_samples_epoch_{self.current_epoch}.txt")
             with open(problematic_file, 'w') as f:
                 for sample_info in self.problematic_samples:
@@ -1178,7 +1199,6 @@ class SegmentationNet(pl.LightningModule):
         
     def on_test_start(self):
         self.test_step_outputs = []
-        # Make test-time deterministic to stabilize threshold/LCC decisions
         try:
             import torch
             torch.backends.cudnn.benchmark = False
@@ -1188,24 +1208,73 @@ class SegmentationNet(pl.LightningModule):
 
     def test_step(self, batch, batch_idx):
         tst_inputs = batch["image"].to(self._device)
-        
+        thr = float(os.getenv("PRED_THRESHOLD", getattr(args, "pred_threshold", 0.5))) #added for manual threshold control
         with torch.no_grad():
             # Determine ROI size for inference
             raw_test_roi_size = args.test_patch_size if args.test_patch_size is not None else args.patch_size
             test_roi_size = (raw_test_roi_size,) * 3 if isinstance(raw_test_roi_size, int) else raw_test_roi_size
-            
             print(f"Using test ROI size: {test_roi_size}")
-            
-            # Perform sliding window inference
-            logits = sliding_window_inference(
-                inputs=tst_inputs,
-                roi_size=test_roi_size,
-                sw_batch_size=1,
-                predictor=self.forward,
-                overlap=0.25,  # Increased overlap for smoother predictions
-                mode="gaussian", # Use Gaussian blending
-                cval=0
-            )
+            ovlp = 0.5 # Increased overlap for smoother predictions
+            banks_dir = os.getenv("PATCH_BANKS_DIR", "./ATM22/npy_files/patch_banks")
+            use_weighted = bool(int(os.getenv("USE_WEIGHTED_AGGREGATOR", "1")))
+            mode = os.getenv("CONF_SOURCE", "audit").lower()  # "audit" | "landmarks"
+            if use_weighted:
+                # case id from meta (consistent with the bank sampler)
+                case_id = extract_case_id_from_meta(batch.get("image_meta_dict", {}))
+                patch_list, meta = load_patch_bank_for_case(case_id, banks_dir)
+
+                if patch_list:
+                    # build provider
+                    if mode == "landmarks":
+                        # processed spacing if available in meta_dict (optional)
+                        spacing = None
+                        try:
+                            # MONAI MetaTensor sometimes carries pixdim via affine; you can pass None to treat σ as voxels
+                            spacing = None
+                        except Exception:
+                            spacing = None
+                        per_w = make_landmark_weight_provider_from_bank(
+                            patch_list=patch_list,
+                            vol_shape_zyx=tuple(int(v) for v in tst_inputs.shape[-3:]),
+                            roi_zyx=tuple(int(v) for v in test_roi_size),
+                            spacing_zyx_mm=spacing,
+                            sigma_mm=float(os.getenv("CONF_SIGMA_MM", "30.0")),
+                        )
+                    else:
+                        per_w = make_audit_weight_provider(
+                            patch_list=patch_list, roi_zyx=tuple(int(v) for v in test_roi_size)
+                        )
+
+                    logits = weighted_sliding_window_inference(
+                        inputs=tst_inputs,
+                        predictor=self.forward,
+                        roi_size=tuple(int(v) for v in test_roi_size),
+                        overlap=ovlp,
+                        per_window_weight=per_w,
+                        device=self._device,
+                        gaussian_blend=True,
+                    )
+                else:
+                    # Fallback to standard SWI if bank missing
+                    logits = sliding_window_inference(
+                        inputs=tst_inputs,
+                        roi_size=test_roi_size,
+                        sw_batch_size=1,
+                        predictor=self.forward,
+                        overlap=ovlp,
+                        mode="gaussian",
+                        cval=0
+                    )
+            else:
+                logits = sliding_window_inference(
+                    inputs=tst_inputs,
+                    roi_size=test_roi_size,
+                    sw_batch_size=1,
+                    predictor=self.forward,
+                    overlap=ovlp,
+                    mode="gaussian",
+                    cval=0
+                )
 
         # Decollate batch to process each item individually
         decollated_batch = decollate_batch(batch)
@@ -1222,8 +1291,7 @@ class SegmentationNet(pl.LightningModule):
             except Exception:
                 pass
             item["pred"] = pred_mt
-            
-            # Debug: Print shapes before inversion
+            # Debug:Print shapes before inversion
             print(f"\n[DEBUG] Processing item {i}:")
             print(f"  Prediction shape before inversion: {item['pred'].shape}")
             print(f"  Image shape: {item['image'].shape}")
@@ -1236,88 +1304,70 @@ class SegmentationNet(pl.LightningModule):
             if "lung" in item and item["lung"] is not None:
                 lung_processed = item["lung"].clone()  # Keep a copy at processed resolution
             
-            # DEBUG: Save raw logits and thresholded prediction before inversion
-            if getattr(args, 'debug_inference', False):
+            # Save raw logits and thresholded prediction before inversion
+            if getattr(args, "debug_inference", False):
                 debug_dir = os.path.join(output_path, "debug_preds")
                 os.makedirs(debug_dir, exist_ok=True)
-                
+
                 filename = os.path.basename(item.get("image_meta_dict", {}).get("filename_or_obj", f"unknown_{batch_idx}_{i}"))
-                base_name = filename.replace('.npy', '').replace('.nii.gz', '')
-                
-                # Save raw logits
+                base_name = filename.replace(".npy", "").replace(".nii.gz", "")
+
                 import nibabel as nib
                 logits_np = item["pred"].cpu().numpy().squeeze()
-                if hasattr(item["pred"], "affine"):
-                    affine = item["pred"].affine.cpu().numpy()
-                else:
-                    affine = np.eye(4)
-                
-                logits_nii = nib.Nifti1Image(logits_np, affine)
-                nib.save(logits_nii, os.path.join(debug_dir, f"{base_name}_1_raw_logits.nii.gz"))
-                
-                # Save after sigmoid
+                affine = item["pred"].affine.cpu().numpy() if hasattr(item["pred"], "affine") else np.eye(4)
+                nib.save(nib.Nifti1Image(logits_np, affine), os.path.join(debug_dir, f"{base_name}_1_raw_logits.nii.gz"))
+
                 sigmoid_np = torch.sigmoid(item["pred"]).cpu().numpy().squeeze()
-                sigmoid_nii = nib.Nifti1Image(sigmoid_np, affine)
-                nib.save(sigmoid_nii, os.path.join(debug_dir, f"{base_name}_2_sigmoid.nii.gz"))
-                
-                # Save binary mask (match runtime threshold)
-                binary_np = (sigmoid_np > 0.5).astype(np.uint8)
-                binary_nii = nib.Nifti1Image(binary_np, affine)
-                nib.save(binary_nii, os.path.join(debug_dir, f"{base_name}_3_binary_pre_invert.nii.gz"))
-                
-                print(f"  DEBUG: Saved pre-inversion files to debug_preds/")
+                nib.save(nib.Nifti1Image(sigmoid_np, affine), os.path.join(debug_dir, f"{base_name}_2_sigmoid.nii.gz"))
+                binary_np = (sigmoid_np > thr).astype(np.uint8)
+                nib.save(nib.Nifti1Image(binary_np, affine), os.path.join(debug_dir, f"{base_name}_3_binary_pre_invert.nii.gz"))
+                print("  DEBUG: Saved pre-inversion files to debug_preds/")
             
-            # --- UNIFIED POST-PROCESSING PIPELINE ---
             
+            # --- POST-PROCESSING PIPELINE ---
             # 1) Activation + threshold in processed space
             preinvert_pipeline = Compose([
                 Activationsd(keys="pred", sigmoid=True),
-                AsDiscreted(keys="pred", threshold=0.5),
+                AsDiscreted(keys="pred", threshold=float(os.getenv('PRED_THRESHOLD', args.pred_threshold))),
             ])
             item = preinvert_pipeline(item)
 
-            if args.metric_testing:
+            if getattr(args, "metric_testing", False):
                 label_np = item["label"].cpu().numpy().squeeze().astype(np.uint8)
                 pred_np = item["pred"].cpu().numpy().squeeze().astype(np.uint8)
-                
-                # Provide a lungs mask in processed space to satisfy topology utilities
+
                 if "lung" in item and item["lung"] is not None:
                     lungs_np = (item["lung"].cpu().numpy().squeeze() > 0).astype(np.uint8)
                 else:
                     lungs_np = np.ones_like(label_np, dtype=np.uint8)
-                
-                iou, dlr, dbr, precision, leakage, amr, _, _, _, _, _, _, large_cd = evaluation_branch_metrics(
+
+                iou, dlr, dbr, precision, leakage, amr, *_tmp, largest_cc = evaluation_branch_metrics(
                     fid=item.get("image_meta_dict", {}).get("filename_or_obj", "unknown"),
                     label=label_np,
                     pred=pred_np,
                     lungs=lungs_np,
-                    refine=False
+                    refine=False,
                 )
-                # Full-volume Dice (as before)
                 intersection_full = float(((pred_np > 0) & (label_np > 0)).sum())
                 denom_full = float((pred_np > 0).sum() + (label_np > 0).sum())
                 dice_full = (2.0 * intersection_full / denom_full) if denom_full > 0 else 0.0
-
-                # Full-volume IoU (as before)
                 union_full = float((pred_np > 0).sum() + (label_np > 0).sum() - ((pred_np > 0) & (label_np > 0)).sum())
                 iou_full = (intersection_full / union_full) if union_full > 0 else 0.0
 
-                # LCC IoU (from evaluation), compute LCC Dice to match it
-                iou_lcc = float(iou)
-                if large_cd is not None:
-                    inter_lcc = float(np.logical_and(large_cd > 0, label_np > 0).sum())
-                    denom_lcc = float(large_cd.sum() + (label_np > 0).sum())
+                # LCC dice (matching the LCC IoU that eval returns)
+                dice_lcc = 0.0
+                if largest_cc is not None:
+                    lcc = (largest_cc > 0).astype(np.uint8)
+                    gt = (label_np > 0).astype(np.uint8)
+                    inter_lcc = float((lcc & gt).sum())
+                    denom_lcc = float(lcc.sum() + gt.sum())
                     dice_lcc = (2.0 * inter_lcc / denom_lcc) if denom_lcc > 0 else 0.0
-                else:
-                    dice_lcc = 0.0
-
                 metrics = {
                     "iou_full": iou_full,
                     "dice_full": dice_full,
-                    "iou_lcc": iou_lcc,
-                    "dice_lcc": dice_lcc,
-                    # Back-compat keys
-                    "iou": iou_lcc,
+                    "iou_lcc": float(iou),         # IoU of the selected LCC against GT
+                    "dice_lcc": float(dice_lcc),
+                    "iou": iou_full,
                     "dice": dice_full,
                     "dlr": dlr,
                     "dbr": dbr,
@@ -1328,9 +1378,8 @@ class SegmentationNet(pl.LightningModule):
                 self.test_step_outputs.append(metrics)
                 filename = os.path.basename(item.get("image_meta_dict", {}).get("filename_or_obj", f"unknown_{batch_idx}_{i}"))
                 print(f"Metrics for {filename}: {metrics}")
-                # Also save prediction volumes if requested
-                if getattr(args, 'save_val', False):
-                    # Invert to original space using the same transform chain as input
+                # 1a) Optional, if we want to save during metric testing (invert + postproc + save)
+                if getattr(args, "save_val", False):
                     invert_source_transform = self.data_module.val_transforms
                     keys_to_invert = ["pred"]
                     meta_keys_list = ["pred_meta_dict"]
@@ -1349,73 +1398,93 @@ class SegmentationNet(pl.LightningModule):
                             nearest_interp=True,
                             to_tensor=True,
                         )
-                    ])
+                    ])  # documented path for invertible pipelines.
                     save_item = inverter(dict(item))
-                    # Ensure binary after inversion
-                    save_item = Compose([AsDiscreted(keys="pred", threshold=0.5)])(save_item)
 
-                    # Apply post-inversion lung masking and LCC (mirror off_val logic)
+                    # Ensure binary after inversion, still using `thr`
+                    save_item = Compose([AsDiscreted(keys="pred", threshold=thr)])(save_item)
+
+                    # ----- Optional ROI gating / LCC -----
                     try:
                         import numpy as _np
                         from scipy.ndimage import binary_dilation as _bin_dilate
 
-                        pred_np = (save_item["pred"].cpu().numpy().squeeze() > 0.5).astype(_np.uint8)
+                        pred_np = (save_item["pred"].cpu().numpy().squeeze() > thr).astype(_np.uint8)
                         initial_pred_count = int(_np.sum(pred_np > 0))
+                        roi_mode = os.getenv("LUNG_POSTPROC_MODE", "off").lower()
+                        k = int(os.getenv("KEEP_COMPONENTS", "2"))
+                        apply_pp = (roi_mode in ("mask", "bbox")) or (k > 0)
 
-                        lung_np = None
-                        if "lung" in save_item and save_item["lung"] is not None:
-                            lung_np = (save_item["lung"].cpu().numpy().squeeze() > 0).astype(_np.uint8)
-                            if lung_np.shape != pred_np.shape:
-                                lung_np = None
+                        if apply_pp:
+                            lung_np = None
+                            if "lung" in save_item and save_item["lung"] is not None:
+                                lung_np = (save_item["lung"].cpu().numpy().squeeze() > 0).astype(_np.uint8)
+                                if lung_np.shape != pred_np.shape:
+                                    lung_np = None
 
-                        if lung_np is not None and float(_np.sum(lung_np > 0)) > 0.05 * float(_np.prod(lung_np.shape)):
-                            _vx = 1.0
-                            if hasattr(save_item["pred"], "affine") and save_item["pred"].affine is not None:
-                                _aff = save_item["pred"].affine
-                                if hasattr(_aff, "detach"):
-                                    _aff = _aff.detach().cpu().numpy()
-                                else:
-                                    _aff = _np.array(_aff)
-                                _spacing = _np.sqrt((_aff[:3, :3] ** 2).sum(axis=0)).astype(float)
-                                x_sp = float(_spacing[0]) if _spacing.size >= 1 else 1.0
-                                if not _np.isfinite(x_sp) or x_sp <= 0.0:
-                                    try:
-                                        x_sp = float(_np.mean(_spacing))
-                                    except Exception:
-                                        x_sp = 1.0
-                                _vx = x_sp
-                                _iters = int(max(1, round(10.0 / float(_vx))))
-                                lung_dilated = _bin_dilate(lung_np > 0, iterations=_iters)
+                            if roi_mode in ("mask", "bbox") and (lung_np is not None) and float(_np.sum(lung_np > 0)) > 0.05 * float(_np.prod(lung_np.shape)):
+                                # spacing from affine
+                                _vx = 1.0
+                                if hasattr(save_item["pred"], "affine") and save_item["pred"].affine is not None:
+                                    _aff = save_item["pred"].affine
+                                    _aff = _aff.detach().cpu().numpy() if hasattr(_aff, "detach") else _np.array(_aff)
+                                    _spacing = _np.sqrt((_aff[:3, :3] ** 2).sum(axis=0)).astype(float)
+                                    x_sp = float(_spacing[0]) if _spacing.size >= 1 else 1.0
+                                    if not _np.isfinite(x_sp) or x_sp <= 0.0:
+                                        x_sp = float(_np.mean(_spacing)) if _np.isfinite(_np.mean(_spacing)) else 1.0
+                                    _vx = x_sp
 
-                            test_masked = pred_np * lung_dilated.astype(_np.uint8)
-                            masked_count = int(_np.sum(test_masked > 0))
-                            removal_ratio = (initial_pred_count - masked_count) / float(max(initial_pred_count, 1))
-                            if float(removal_ratio) < 0.5:
-                                pred_np = test_masked
+                                if roi_mode == "mask":
+                                    _mm = float(os.getenv("LUNG_MASK_DILATION_MM", "10.0"))
+                                    _iters = int(max(0, round(_mm / float(max(_vx, 1e-6)))))
+                                    lung_dilated = _bin_dilate(lung_np > 0, iterations=_iters)
+                                    test_masked = pred_np * lung_dilated.astype(_np.uint8)
+                                    masked_count = int(_np.sum(test_masked > 0))
+                                    removal_ratio = (initial_pred_count - masked_count) / float(max(initial_pred_count, 1))
+                                    if removal_ratio <= float(os.getenv("LUNG_MASK_MAX_REMOVAL", "0.5")):
+                                        pred_np = test_masked
+                                else:  # bbox
+                                    _mm_margin = float(os.getenv("LUNG_BBOX_MARGIN_MM", "5.0"))
+                                    _vox_margin = int(max(0, round(_mm_margin / float(max(_vx, 1e-6)))))
+                                    zs, ys, xs = _np.where(lung_np > 0)
+                                    if zs.size > 0:
+                                        z0, z1 = max(0, int(zs.min()) - _vox_margin), min(pred_np.shape[0]-1, int(zs.max()) + _vox_margin)
+                                        y0, y1 = max(0, int(ys.min()) - _vox_margin), min(pred_np.shape[1]-1, int(ys.max()) + _vox_margin)
+                                        x0, x1 = max(0, int(xs.min()) - _vox_margin), min(pred_np.shape[2]-1, int(xs.max()) + _vox_margin)
+                                        crop_mask = _np.zeros_like(pred_np, dtype=_np.uint8)
+                                        crop_mask[z0:z1+1, y0:y1+1, x0:x1+1] = 1
+                                        pred_np = (pred_np > 0).astype(_np.uint8) & crop_mask
 
-                        if pred_np.any():
-                            pred_np = get_lcc(pred_np)
-                        pred_topk_t = torch.from_numpy(pred_np).to(save_item["pred"].device).unsqueeze(0).to(save_item["pred"].dtype)
-                        save_item["pred"] = pred_topk_t
+                            # LCC (dictionary version) — documented post transform.
+                            if k > 0 and pred_np.any():
+                                tmp = {"pred": torch.from_numpy(pred_np[None])}
+                                tmp = KeepLargestConnectedComponentd(keys="pred", num_components=k)(tmp)
+                                pred_np = tmp["pred"].cpu().numpy().squeeze().astype(np.uint8)
+                            _old = save_item["pred"]
+                            pred_t = torch.from_numpy(pred_np[None]).to(device=_old.device, dtype=_old.dtype)
+                            save_item["pred"] = MetaTensor(pred_t, meta=getattr(_old, "meta", None), affine=getattr(_old, "affine", None))
+
                     except Exception as _e:
                         print(f"  Warning: post-inversion processing during metric-saving failed: {_e}")
 
-                    # Drop lung before saving (already applied)
                     if "lung" in save_item:
                         save_item.pop("lung")
 
                     saver = SaveImageWithOriginalMetadatad(
-                        keys="pred",
-                        output_dir=os.path.join(output_path, "preds"),
-                        output_postfix="seg",
-                        separate_folder=True,
-                        print_log=True,
-                        resample_full_volume=False,
+                        keys="pred", output_dir=os.path.join(output_path, "preds"),
+                        output_postfix="seg", separate_folder=True, print_log=True,
+                        resample_full_volume=True,
                     )
                     saver(save_item)
+                # move to next item
                 continue
             # 2) Invert only the prediction back to original space
-            invert_source_transform = self.data_module.val_transforms if args.metric_testing else self.data_module.test_transforms
+            use_val_chain = bool(getattr(args, "metric_testing", False)) or (
+                str(getattr(args, "test_dataset", "")).lower() == "val"
+            )
+            invert_source_transform = (
+                self.data_module.val_transforms if use_val_chain else self.data_module.test_transforms
+            )
             keys_to_invert = ["pred"]
             meta_keys_list = ["pred_meta_dict"]
             if "lung" in item and item["lung"] is not None:
@@ -1432,96 +1501,84 @@ class SegmentationNet(pl.LightningModule):
                     meta_key_postfix="meta_dict",
                     nearest_interp=True,
                     to_tensor=True,
-                )
+                    )
             ])
             processed_item = inverter(item)
-
-            # Post-inversion cleanup: ensure binary prediction
-            postinvert_pipeline = Compose([
-                AsDiscreted(keys="pred", threshold=0.5),
-            ])
-            processed_item = postinvert_pipeline(processed_item)
-
-            # 2b) Post-inversion lung masking and top-K component retention for inference
-            if not args.metric_testing:
+            processed_item = Compose([AsDiscreted(keys="pred", threshold=float(os.getenv("PRED_THRESHOLD", getattr(args, "pred_threshold", 0.5))))])(processed_item)
+            # 2b) Optional post-inversion lung ROI gating (mask | bbox) and LCC for inference
+            # Optional ROI gating / LCC in inference mode
+            roi_mode = os.getenv("LUNG_POSTPROC_MODE", "off").lower()
+            k = int(os.getenv("KEEP_COMPONENTS", "2"))
+            apply_pp = (roi_mode in ("mask", "bbox")) or (k > 0)
+            if apply_pp:
                 try:
                     import numpy as _np
                     from scipy.ndimage import binary_dilation as _bin_dilate
 
-                    pred_np = (processed_item["pred"].cpu().numpy().squeeze() > 0.5).astype(_np.uint8)
-
-                    # DEBUG: Count initial voxels
+                    pred_np = (processed_item["pred"].cpu().numpy().squeeze() > float(os.getenv("PRED_THRESHOLD", getattr(args, "pred_threshold", 0.5)))).astype(_np.uint8)
                     initial_pred_count = int(_np.sum(pred_np > 0))
                     print(f"  Initial prediction voxels: {initial_pred_count:,}")
 
-                    # Use inverted lung from pipeline if available
                     lung_np = None
-                    if "lung" in processed_item and processed_item["lung"] is not None:
-                        lung_np = (processed_item["lung"].cpu().numpy().squeeze() > 0).astype(_np.uint8)
+                    if roi_mode in ("mask", "bbox"):
+                        if "lung" in processed_item and processed_item["lung"] is not None:
+                            lung_np = (processed_item["lung"].cpu().numpy().squeeze() > 0).astype(_np.uint8)
+                            if lung_np.shape != pred_np.shape:
+                                print(f"  WARNING: Lung shape {lung_np.shape} != pred shape {pred_np.shape}")
+                                lung_np = None
 
-                        # DEBUG: Check lung mask coverage
-                        lung_coverage = float(_np.sum(lung_np > 0)) / float(_np.prod(lung_np.shape))
-                        print(f"  Lung mask coverage: {lung_coverage:.1%}")
-
-                        # Verify lung mask and prediction are in same coordinate system
-                        if lung_np.shape != pred_np.shape:
-                            print(f"  WARNING: Lung shape {lung_np.shape} != pred shape {pred_np.shape}")
-                            lung_np = None
-
-                    # Apply conservative lung masking only if lung mask looks reasonable
-                    if lung_np is not None and float(_np.sum(lung_np > 0)) > 0.05 * float(_np.prod(lung_np.shape)):
+                    if (roi_mode in ("mask", "bbox")) and (lung_np is not None) and float(_np.sum(lung_np > 0)) > 0.05 * float(_np.prod(lung_np.shape)):
                         try:
-                            # Get voxel spacing for dilation
                             _vx = 1.0
                             if hasattr(processed_item["pred"], "affine") and processed_item["pred"].affine is not None:
                                 _aff = processed_item["pred"].affine
-                                if hasattr(_aff, "detach"):
-                                    _aff = _aff.detach().cpu().numpy()
-                                else:
-                                    _aff = _np.array(_aff)
-                                _spacing = _np.sqrt((_aff[:3, :3] ** 2).sum(axis=0)).astype(float)  # vector of 3
-                                # Safely pick a scalar spacing (prefer X; fall back to mean)
+                                _aff = _aff.detach().cpu().numpy() if hasattr(_aff, "detach") else _np.array(_aff)
+                                _spacing = _np.sqrt((_aff[:3, :3] ** 2).sum(axis=0)).astype(float)
                                 x_sp = float(_spacing[0]) if _spacing.size >= 1 else 1.0
                                 if not _np.isfinite(x_sp) or x_sp <= 0.0:
-                                    try:
-                                        x_sp = float(_np.mean(_spacing))
-                                    except Exception:
-                                        x_sp = 1.0
+                                    x_sp = float(_np.mean(_spacing)) if _np.isfinite(_np.mean(_spacing)) else 1.0
                                 _vx = x_sp
-                                # Conservative dilation
-                                _iters = int(max(1, round(10.0 / float(_vx))))
+
+                            if roi_mode == "mask":
+                                _mm = float(os.getenv("LUNG_MASK_DILATION_MM", "10.0"))
+                                _iters = int(max(0, round(_mm / float(max(_vx, 1e-6)))))
                                 lung_dilated = _bin_dilate(lung_np > 0, iterations=_iters)
-
-                            # Test masking impact before applying
-                            test_masked = pred_np * lung_dilated.astype(_np.uint8)
-                            masked_count = int(_np.sum(test_masked > 0))
-                            removal_ratio = (initial_pred_count - masked_count) / float(max(initial_pred_count, 1))
-                            print(f"  Lung masking would remove {removal_ratio:.1%} of prediction")
-
-                            # Only apply lung masking if it doesn't remove too much
-                            if float(removal_ratio) < 0.5:
-                                pred_np = test_masked
-                                print(f"  Applied lung masking (removed {removal_ratio:.1%})")
-                            else:
-                                print(f"  SKIPPED lung masking - would remove too much ({removal_ratio:.1%})")
+                                test_masked = pred_np * lung_dilated.astype(_np.uint8)
+                                masked_count = int(_np.sum(test_masked > 0))
+                                removal_ratio = (initial_pred_count - masked_count) / float(max(initial_pred_count, 1))
+                                print(f"  Lung masking would remove {removal_ratio:.1%} of prediction")
+                                if removal_ratio <= float(os.getenv("LUNG_MASK_MAX_REMOVAL", "0.5")):
+                                    pred_np = test_masked
+                                    print(f"  Applied lung masking (removed {removal_ratio:.1%})")
+                                else:
+                                    print(f"  SKIPPED lung masking - would remove too much ({removal_ratio:.1%})")
+                            else:  # bbox
+                                _mm_margin = float(os.getenv("LUNG_BBOX_MARGIN_MM", "5.0"))
+                                _vox_margin = int(max(0, round(_mm_margin / float(max(_vx, 1e-6)))))
+                                zs, ys, xs = _np.where(lung_np > 0)
+                                if zs.size > 0:
+                                    z0, z1 = max(0, int(zs.min()) - _vox_margin), min(pred_np.shape[0]-1, int(zs.max()) + _vox_margin)
+                                    y0, y1 = max(0, int(ys.min()) - _vox_margin), min(pred_np.shape[1]-1, int(ys.max()) + _vox_margin)
+                                    x0, x1 = max(0, int(xs.min()) - _vox_margin), min(pred_np.shape[2]-1, int(xs.max()) + _vox_margin)
+                                    crop_mask = _np.zeros_like(pred_np, dtype=_np.uint8)
+                                    crop_mask[z0:z1+1, y0:y1+1, x0:x1+1] = 1
+                                    pred_np = (pred_np > 0).astype(_np.uint8) & crop_mask
 
                         except Exception as e:
-                            print(f"  Lung masking failed: {e}, proceeding without lung mask")
-                    else:
-                        print("  Skipping lung masking - insufficient lung coverage")
+                            print(f"  Lung ROI gating failed: {e}, proceeding without ROI gating")
 
-                    # Apply LCC only if there are remaining voxels
-                    if pred_np.any():
-                        pred_np = get_lcc(pred_np)
-                        final_count = int(_np.sum(pred_np > 0))
-                        print(f"  Final voxels after LCC: {final_count:,}")
+                    # Keep top-K components if requested
+                    if k > 0 and pred_np.any():
+                        tmp = {"pred": torch.from_numpy(pred_np[None])}
+                        tmp = KeepLargestConnectedComponentd(keys="pred", num_components=k)(tmp)
+                        pred_np = tmp["pred"].cpu().numpy().squeeze().astype(np.uint8)
 
-                    # Convert back to tensor
-                    pred_topk_t = torch.from_numpy(pred_np).to(processed_item["pred"].device).unsqueeze(0).to(processed_item["pred"].dtype)
-                    processed_item["pred"] = pred_topk_t
+                    # WRITE BACK and preserve meta/affine
+                    _old = processed_item["pred"]
+                    pred_t = torch.from_numpy(pred_np[None]).to(device=_old.device, dtype=_old.dtype)
+                    processed_item["pred"] = MetaTensor(pred_t, meta=getattr(_old, "meta", None), affine=getattr(_old, "affine", None))
 
-                    # Optional debug saving
-                    if getattr(args, 'debug_inference', False):
+                    if getattr(args, "debug_inference", False):
                         try:
                             import nibabel as _nib
                             aff_post = processed_item["pred"].affine.cpu().numpy() if hasattr(processed_item["pred"], "affine") else _np.eye(4)
@@ -1534,23 +1591,21 @@ class SegmentationNet(pl.LightningModule):
             else:
                 print("Metric testing mode detected. Skipping post-inversion processing.")
 
-            # Debug: Print shapes after inversion
+            # Debug after inversion
             print(f"  Prediction shape after inversion: {processed_item['pred'].shape}")
-            pred_voxels = torch.sum(processed_item['pred'] > 0).item()
+            pred_voxels = torch.sum(processed_item["pred"] > 0).item()
             print(f"  Non-zero prediction voxels after inversion: {pred_voxels}")
-            
-            # In inference mode, save the final prediction
-            # Remove lung to avoid a second masking at save-time (already masked post-inversion)
+
+            # Save final prediction
             if "lung" in processed_item:
                 processed_item.pop("lung")
-
             saver = SaveImageWithOriginalMetadatad(
                 keys="pred",
                 output_dir=os.path.join(output_path, "preds"),
                 output_postfix="seg",
                 separate_folder=True,
                 print_log=True,
-                resample_full_volume=False,
+                resample_full_volume=True,
             )
             saver(processed_item)
 
@@ -1571,11 +1626,8 @@ class SegmentationNet(pl.LightningModule):
             return
             
         avg_metrics = {}
-        # Ensure all dictionaries in test_step_outputs have the same keys by using the first as a reference
         metric_keys = self.test_step_outputs[0].keys() if self.test_step_outputs else []
         for key in metric_keys:
-            # Safely get values, defaulting to NaN if a key is missing in some dict.
-            # Then filter out NaNs before computing the mean.
             valid_values = [d[key] for d in self.test_step_outputs if key in d and d[key] is not None]
             if valid_values:
                 avg_metrics[f"avg_test_{key}"] = np.mean(valid_values)
@@ -1709,34 +1761,18 @@ if __name__ == '__main__':
         else:
             print("=== CUDA is NOT available ===")
         
-        # Set multiprocessing start method
+        # Ensure multiprocessing start method is safe for CUDA
         if params_dict['NUM_WORKERS'] > 0:
             current_method = mp.get_start_method(allow_none=True)
-            if current_method is None:
-                # Set to 'spawn' if no method is set or if it's 'fork' (default on Linux)
-                # and we're using CUDA, as 'spawn' is safer.
-                if torch.cuda.is_available():
-                    try:
-                        mp.set_start_method('fork', force=True)
-                        print("Set multiprocessing start method to 'fork'")
-                    except RuntimeError as e:
-                        print(f"Failed to set start_method to '': {e}. Current method: {mp.get_start_method(allow_none=True)}")
-                else:
-                    try:
-                        mp.set_start_method('fork', force=True) # Keep fork if no CUDA
-                        print("Set multiprocessing start method to 'fork' (no CUDA)")
-                    except RuntimeError as e:
-                        print(f"Failed to set_start_method to 'fork': {e}. Current method: {mp.get_start_method(allow_none=True)}")
-
-            elif current_method == 'fork' and torch.cuda.is_available():
-                # If method is 'fork' and CUDA is available, change to 'fork'
+            desired = 'spawn' if torch.cuda.is_available() else 'fork'
+            if current_method != desired:
                 try:
-                    mp.set_start_method('fork', force=True)
-                    print(f"Changed multiprocessing start method from '{current_method}' to 'fork'")
+                    mp.set_start_method(desired, force=True)
+                    print(f"Set multiprocessing start method to '{desired}'")
                 except RuntimeError as e:
-                    print(f"Failed to change start_method from '{current_method}' to 'fork': {e}. Current method: {mp.get_start_method(allow_none=True)}")
+                    print(f"Could not set start method to '{desired}': {e}. Using '{current_method}'.")
             else:
-                print(f"Multiprocessing start method already set to '{current_method}'. No change needed.")
+                print(f"Multiprocessing start method already '{current_method}'.")
 
         model = SegmentationNet(device=device, data_module=data_module)
         model._initialize_weights()
@@ -1759,7 +1795,6 @@ if __name__ == '__main__':
             data_module.setup("fit") # Ensure datasets are prepared
             if hasattr(data_module, 'train_ds') and data_module.train_ds is not None:
                 actual_smartcache_ds = None
-                # The SmartCacheDataset is now the .data attribute of the wrapping monai.data.Dataset
                 if hasattr(data_module.train_ds, 'data') and \
                    isinstance(data_module.train_ds.data, monai.data.SmartCacheDataset):
                     actual_smartcache_ds = data_module.train_ds.data
@@ -1838,23 +1873,22 @@ if __name__ == '__main__':
 
             print(f"The output path is {output_path}")
             print(f"The model_path for training checkpoints is {model_path}")
-            # initialize the trainer with GPU accelerator
             trainer = pl.Trainer(
                 accelerator="gpu",
                 devices=1,
                 num_nodes=1,
                 max_epochs=args.max_epochs,
-                default_root_dir=model_path, # Trainer will use this for its own logging if needed
+                default_root_dir=model_path, # Trainer will use ts for its own logging if needed
                 log_every_n_steps=20,
                 precision='16-mixed' if args.mixed else '32-true',
                 strategy="auto",
                 enable_model_summary=True,
-                max_time=datetime.timedelta(hours=args.max_time_hours),
+                max_time=(datetime.timedelta(hours=args.max_time_hours) if (args.max_time_hours is not None and args.max_time_hours > 0) else None),
                 deterministic="warn",
                 gradient_clip_val=1.0,
                 num_sanity_val_steps=1, 
                 enable_checkpointing=True, 
-                accumulate_grad_batches=2,
+                accumulate_grad_batches=1,
                 check_val_every_n_epoch=1, 
                 enable_progress_bar=True,
                 sync_batchnorm=False, 
@@ -1863,7 +1897,6 @@ if __name__ == '__main__':
             print("\n==== GPU INFORMATION BEFORE TRAINING ====")
             monitor_gpu_usage()   
             
-            # Support resuming from checkpoint
             ckpt_path = None
             if args.resume_from_checkpoint:
                 if os.path.exists(args.resume_from_checkpoint):
@@ -1891,7 +1924,6 @@ if __name__ == '__main__':
 
             trainer.fit(net, datamodule=data_module, ckpt_path=ckpt_path)
             print(f"train completed, best_metric: {net.best_val_dice:.4f} Dice and {net.best_val_iou:.4f} IoU " f"at epoch {net.best_val_epoch}")
-            # Print summary after training
             print("\n==== GPU INFORMATION AFTER TRAINING ====")
             monitor_gpu_usage()
 
@@ -1952,7 +1984,6 @@ if __name__ == '__main__':
             # initialize the lightning module
             net = SegmentationNet(device=device, data_module=data_module)
             net.to(device)
-            # Verify model is on GPU
             diagnose_model_placement(net._model)
             model_path = os.path.join(output_path, "model_AWC")
             os.makedirs(model_path, exist_ok=True)
@@ -1976,7 +2007,6 @@ if __name__ == '__main__':
             )
             
             validation_callbacks = [checkpoint_callback, lr_monitor, early_stop_callback]
-            # Add smartcache if applicable and created
             if 'smartcache_callback' in locals() and smartcache_callback is not None and data_module.cache_dataset and data_module.use_smartcache:
                 validation_callbacks.append(smartcache_callback)
 
@@ -2008,14 +2038,11 @@ if __name__ == '__main__':
             model_dir = os.path.join(output_path, "model")
             
             checkpoint_path = None
-            # 1) If a specific weights_path was provided
             if args.weights_path:
-                # Use as-is if it exists (absolute or relative)
                 if os.path.exists(args.weights_path):
                     checkpoint_path = args.weights_path
                     print(f"Using explicitly provided checkpoint: {checkpoint_path}")
                 else:
-                    # Try resolving relative to the experiment's model directory
                     candidate = os.path.join(model_dir, os.path.basename(args.weights_path))
                     if os.path.exists(candidate):
                         checkpoint_path = candidate
@@ -2054,7 +2081,6 @@ if __name__ == '__main__':
             # Save final aggregate results
             test_results_file = os.path.join(output_path, "final_test_metrics.json")
             with open(test_results_file, 'w') as f:
-                # test_results is a list containing one dict
                 json.dump(test_results[0] if test_results else {}, f, indent=4)
             print(f"Final aggregated test results saved to: {test_results_file}")
 

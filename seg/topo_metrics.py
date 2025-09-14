@@ -13,12 +13,14 @@ try:
 except ImportError:  # Newer scikit-image
     from skimage.morphology import skeletonize as _skeletonize_3d  # type: ignore
 
-from .metrics import get_parsing
+from .metrics import get_parsing, skeleton_parsing, tree_parsing_func, large_connected_domain
 import math
 EPSILON = 1e-32
-DBR_DETECTION_THRESHOLD = 0.6  # threshold for considering a branch detected
+DBR_DETECTION_THRESHOLD = float(os.getenv("DBR_DETECTION_THRESHOLD", "0.8")) #Reference: https://arxiv.org/pdf/2507.06581
+# EXACT'09-style minimum recovered centerline length to count a branch as detected. Reference: EXACT'09 paper Lo, P. and van Ginneken, B. and Reinhardt, J M. and Tarunashree, Y. and Jong, Irving B.;  Extraction of Airways From CT (EXACT’09); IEEE Transactions on Medical Imaging, 2012.
+DBR_MIN_HIT_MM = float(os.getenv("DBR_MIN_HIT_MM", "1.0"))
 
-# Debug control settings
+# Debug control settings (read at import time)
 DEBUG_TOPOLOGY_METRICS = os.getenv('DEBUG_TOPOLOGY_METRICS', 'detailed').lower()
 MAX_DEBUG_COMPONENTS = int(os.getenv('MAX_DEBUG_COMPONENTS', '10'))
 MAX_COMPONENTS_THRESHOLD = int(os.getenv('MAX_COMPONENTS_THRESHOLD', '50000'))
@@ -49,7 +51,7 @@ def compute_binary_iou(y_true, y_pred, lungs=None, masked=False):
     return float(intersection) / float(union) if union > 0 else 0.0
 
 
-def evaluation_branch_metrics(fid, label, pred, lungs=None, refine=False):
+def evaluation_branch_metrics(fid, label, pred, lungs=None, refine=False, spacing_zyx_mm=None):
     """
     :return: iou, dice, detected length ratio, detected branch ratio,
     precision, leakages, airway missing ratio (AMR),
@@ -60,7 +62,18 @@ def evaluation_branch_metrics(fid, label, pred, lungs=None, refine=False):
     label = (label > 0).astype(np.uint8)
     pred = (pred > 0).astype(np.uint8)
 
-    parsing_gt = get_parsing(label, refine)
+    # Note: No early cropping or fast-path returns here; keep original behavior
+
+    # Build branch parsing once without re-skeletonizing multiple times
+    # Follow same steps as get_parsing but reuse pieces locally to avoid duplicate work elsewhere
+    # 1) Restrict to largest connected component (airway tree)
+    mask_lcc = large_connected_domain((label > 0).astype(np.uint8))
+    # 2) Skeletonize LCC only (consistent with get_parsing semantics)
+    skel = _skeletonize_3d(mask_lcc)
+    skel = (skel > 0).astype(np.uint8)
+    # 3) Parse branches on skeleton and propagate labels into mask
+    skel_parse, skel_cd, _skel_num = skeleton_parsing(skel)
+    parsing_gt = tree_parsing_func(skel_parse, mask_lcc, skel_cd)
 
     cd, num = measure.label(pred, return_num=True, connectivity=1)
     # --- Debug: report number of components ---
@@ -141,7 +154,7 @@ def evaluation_branch_metrics(fid, label, pred, lungs=None, refine=False):
         print(f"DEBUG eval_metrics: Top {len(debug_top_list)} components by volume:")
         # debug_top_list already sorted by volume desc due to 'order'
         for lab, vol, iou_cand in debug_top_list:
-            sel_mark = " ✓ SELECTED" if lab == selected_lab else ""
+            sel_mark = "SELECTED" if lab == selected_lab else ""
             print(f"  - label={lab}: volume={vol}, IoU={iou_cand:.4f}{sel_mark}")
         elapsed = time.time() - start_time
         print(f"DEBUG eval_metrics: Selected component label={selected_lab} with IoU={iou:.4f} (volume={selected_vol}), analysis completed in {elapsed:.3f}s")
@@ -160,29 +173,60 @@ def evaluation_branch_metrics(fid, label, pred, lungs=None, refine=False):
         GT = label.sum()
         AMR = float(FN) / float(GT) if GT != 0 else 0.0
         return iou, 0, 0, precision, leakages, AMR, ious, 0, 0, precision, leakages, AMR, large_cd
-
-    # Topology metrics (DLR/DBR)
-    skeleton = _skeletonize_3d(label)
-    skeleton = (skeleton > 0).astype("uint8")
+    #step size in mm for centerline voxels (fallback 1.0 mm/vox)
+    step_mm = float(np.mean(np.asarray(spacing_zyx_mm))) if spacing_zyx_mm is not None else 1.0
+    min_hit_vox = max(1, int(round(DBR_MIN_HIT_MM / max(step_mm, 1e-8))))
+    # Topology metrics (DLR/DBR) on LCC skeleton to match parsing
+    skeleton = skel  # already uint8
     if skeleton.sum() == 0:
         DLR, DBR = 0.0, 0.0
     else:
-        DLR = float((large_cd & skeleton).sum()) / float(skeleton.sum())
+        DLR = float((large_cd & skeleton).sum()) / float(max(int(skeleton.sum()), 1))
 
         num_branch = int(parsing_gt.max())
+        # Vectorized DBR computation
         if num_branch == 0:
             DBR = 0.0
-        else:
             detected_num = 0
-            for j in range(num_branch):
-                branch_label = ((parsing_gt == (j + 1)).astype(np.uint8)) * skeleton
-                denom = int(branch_label.sum())
-                if denom > 0:
-                    overlap_ratio = float((large_cd & branch_label).sum()) / float(denom)
-                    if overlap_ratio >= DBR_DETECTION_THRESHOLD:  # template threshold
-                        detected_num += 1
-            DBR = float(detected_num) / float(num_branch) if num_branch > 0 else 0.0
+        else:
+            # Labels for each skeleton voxel (0 for background)
+            branch_ids = (parsing_gt.astype(np.int32)) * (skeleton.astype(np.int32))
+            # Denominator per branch: number of skeleton voxels per branch
+            denom_counts = np.bincount(branch_ids.ravel(), minlength=num_branch + 1)
+            denom_per_branch = denom_counts[1:]
 
+            # One-time dilation tolerance (~1 mm) outside the loop
+            pred_centerline = (large_cd > 0)
+            tol = max(1, int(round(1.0 / step_mm)))  # ~1 mm tolerance
+            pred_centerline_dil = ndimage.binary_dilation(pred_centerline, iterations=tol)
+
+            # Hits: skeleton voxels whose branch id > 0 and overlap with dilated prediction
+            overlap_mask = (branch_ids > 0) & pred_centerline_dil
+            hit_labels = branch_ids[overlap_mask]
+            hit_counts = np.bincount(hit_labels.ravel(), minlength=num_branch + 1)[1:]
+
+            # Avoid division by zero; branches with denom==0 are ignored in detection
+            with np.errstate(divide='ignore', invalid='ignore'):
+                overlap_ratio = np.zeros_like(hit_counts, dtype=np.float64)
+                valid = denom_per_branch > 0
+                overlap_ratio[valid] = hit_counts[valid] / denom_per_branch[valid]
+
+            detected_num = int(np.sum(overlap_ratio >= DBR_DETECTION_THRESHOLD))
+            DBR = float(detected_num) / float(num_branch)
+
+        # Optional lightweight debug print without per-branch loops
+        if DEBUG_TOPOLOGY_METRICS in ('minimal', 'detailed', 'full'):
+            # Compute median branch length via bincount on skeleton once
+            branch_ids_dbg = (parsing_gt.astype(np.int32)) * (skeleton.astype(np.int32))
+            lengths_dbg = np.bincount(branch_ids_dbg.ravel())
+            median_branch_len = float(np.median(lengths_dbg[1:])) if lengths_dbg.size > 1 else 0.0
+            print(
+                f"DEBUG eval_metrics: num_branch={num_branch}, median_branch_len={median_branch_len:.1f}"
+            )
+            print(
+                f"DEBUG eval_metrics: DLR={DLR:.4f}, DBR={DBR:.4f} "
+                f"(detected {detected_num}/{num_branch} branches with min_hit_vox={min_hit_vox}, step_mm={step_mm:.3f})"
+            )
     precision = float((large_cd & label).sum()) / float(large_cd.sum()) if large_cd.sum() > 0 else 0.0
     leakages = float(((large_cd - label) == 1).sum()) / float(label.sum()) if label.sum() > 0 else 0.0
 

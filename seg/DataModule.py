@@ -62,10 +62,6 @@ safe_globals_to_add = [
     np.ndarray, np.dtype, torch.Size, torch.Tensor,
     tuple, list, dict, type(None),
 ]
-# if hasattr(multiarray, "_reconstruct"):
-#     safe_globals_to_add.append(multiarray._reconstruct)
-# if hasattr(multiarray, "scalar"):
-#     safe_globals_to_add.append(multiarray.scalar)
 add_safe_globals(safe_globals_to_add)
 
 import SimpleITK as sitk
@@ -79,70 +75,17 @@ from seg.utils import find_file_in_path, get_folder_names
 
 # NEW: optional patch bank sampler
 try:
-    from .patch_bank_sampler import SamplePatchFromBankd  # type: ignore
-except Exception:
-    SamplePatchFromBankd = None  # type: ignore
-
-
-# class MaskLabelsWithLungd(MapTransform):
-#     """
-#     Masks the label data to ensure predictions are only inside lung regions.
-#     This prevents the model from learning false positives outside lungs.
-#     """
-#     def __init__(self, keys=["label"], lung_key="lung", allow_missing_keys=False):
-#         super().__init__(keys=keys, allow_missing_keys=allow_missing_keys)
-#         self.lung_key = lung_key
-    
-#     def __call__(self, data):
-#         d = dict(data)
-        
-#         # Check if lung mask exists
-#         if self.lung_key not in d:
-#             return d
-        
-#         lung_mask = d[self.lung_key]
-        
-#         # Process each label key
-#         for key in self.key_iterator(d):
-#             if key in d and d[key] is not None:
-#                 label = d[key]
-                
-#                 # Ensure lung mask and label have same spatial shape
-#                 if hasattr(label, 'shape') and hasattr(lung_mask, 'shape'):
-#                     # Get spatial shapes (excluding channel dimension if present)
-#                     label_shape = label.shape[-3:] if len(label.shape) >= 3 else label.shape
-#                     lung_shape = lung_mask.shape[-3:] if len(lung_mask.shape) >= 3 else lung_mask.shape
-                    
-#                     if label_shape == lung_shape:
-#                         # Zero out labels outside lung regions
-#                         # Convert to same type as label for multiplication
-#                         if isinstance(label, MetaTensor):
-#                             lung_binary = (lung_mask > 0).to(label.dtype)
-#                             d[key] = label * lung_binary
-#                         elif isinstance(label, torch.Tensor):
-#                             lung_binary = (lung_mask > 0).to(label.dtype)
-#                             d[key] = label * lung_binary
-#                         elif isinstance(label, np.ndarray):
-#                             lung_binary = (lung_mask > 0).astype(label.dtype)
-#                             d[key] = label * lung_binary
-                        
-#                         # Count removed voxels for debugging
-#                         if isinstance(label, (torch.Tensor, np.ndarray)):
-#                             original_sum = float((label > 0).sum())
-#                             new_sum = float((d[key] > 0).sum())
-#                             if original_sum > 0:
-#                                 removed_ratio = (original_sum - new_sum) / original_sum
-#                                 if removed_ratio > 0.1:  # If more than 10% removed
-#                                     print(f"[MaskLabelsWithLungd] Removed {removed_ratio*100:.1f}% of label voxels outside lungs")
-        
-#         return d
+    from .patch_bank_sampler import SamplePatchFromBankd
+except Exception as e:
+    import traceback
+    print(f"[DataModule] patch-bank import failed: {e}\n{traceback.format_exc()}")
+    SamplePatchFromBankd = None
 
 
 class SetSpacingFromMeta(MapTransform):
     """
     Sets the spacing of a MetaTensor based on a corresponding _meta.json file.
-    This should be placed right after LoadImaged. It modifies the affine matrix
-    of the MetaTensor to reflect the true spacing of the pre-processed data.
+    It modifies the affine matrix of the MetaTensor to reflect the true spacing of the pre-processed data.
     """
     def __init__(self, keys, allow_missing_keys: bool = False):
         super().__init__(keys=keys, allow_missing_keys=allow_missing_keys)
@@ -153,7 +96,7 @@ class SetSpacingFromMeta(MapTransform):
         key = 'image'
         if key not in self.key_iterator(d):
             return d
-
+        # Get the item
         item = d.get(key)
         if not isinstance(item, MetaTensor) or not hasattr(item, 'meta'):
             return d
@@ -168,20 +111,19 @@ class SetSpacingFromMeta(MapTransform):
             try:
                 with open(json_path, 'r') as f:
                     meta_info = json.load(f)
-                
+                # Extract spacing, direction, and origin
                 spacing = meta_info.get("processed_spacing")
                 direction = np.array(meta_info.get("processed_direction", [1,0,0,0,1,0,0,0,1])).reshape(3,3)
                 origin = np.array(meta_info.get("processed_origin", [0,0,0]))
                 
                 if spacing:
+                    # Construct the new affine matrix
                     affine = np.eye(4)
                     affine[:3, :3] = direction @ np.diag(spacing)
                     affine[:3, 3] = origin
-                    
-                    # Convert numpy affine to a torch.Tensor with the correct device and dtype.
+                    # Move to the same device as the item
                     # Affine matrices in MONAI are typically float64.
                     new_affine = torch.from_numpy(affine.astype(np.float64)).to(device=item.device)
-
                     # Update the affine for the image and propagate to other keys
                     for k in self.key_iterator(d):
                         if isinstance(d.get(k), MetaTensor):
@@ -192,6 +134,35 @@ class SetSpacingFromMeta(MapTransform):
 
     def __repr__(self):
         return f"SetSpacingFromMeta(keys={self.keys})"
+
+
+class BinarizeLungd(MapTransform):
+    """
+    Top-level transform to binarize lung mask(s) to {0,1} without using non-picklable lambdas.
+    This avoids multiprocessing pickling errors in DataLoader workers.
+    """
+    def __init__(self, keys, allow_missing_keys: bool = True):
+        super().__init__(keys=keys, allow_missing_keys=allow_missing_keys)
+
+    def __call__(self, data):
+        d = dict(data)
+        for key in self.key_iterator(d):
+            if key in d and d[key] is not None:
+                arr = d[key]
+                try:
+                    if isinstance(arr, MetaTensor):
+                        d[key] = (arr > 0).to(arr.dtype)
+                    elif isinstance(arr, torch.Tensor):
+                        d[key] = (arr > 0).to(arr.dtype)
+                    else:
+                        d[key] = (np.asarray(arr) > 0).astype(arr.dtype)
+                except Exception:
+                    # Best-effort fallback
+                    d[key] = (np.asarray(arr) > 0).astype(np.uint8)
+        return d
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(keys={self.keys})"
 
 
 def worker_init_fn_enhanced(worker_id):
@@ -234,7 +205,7 @@ class LoadOriginalNiftiHeaderd(MapTransform):
                 filepath = meta_dict.get("filename_or_obj")
 
                 if filepath:
-                    # Handle case where filepath might be a list (from batch processing)
+                    # Handles cases where filepath might be a list of paths
                     if isinstance(filepath, list):
                         filepath = filepath[0] if filepath else None
                     
@@ -248,15 +219,16 @@ class LoadOriginalNiftiHeaderd(MapTransform):
 
                     if os.path.exists(original_filepath):
                         try:
+                            # Load the original NIfTI file using SimpleITK, which is more robust
                             img = sitk.ReadImage(original_filepath)
                             direction = np.array(img.GetDirection()).reshape(3, 3)
                             spacing = np.array(img.GetSpacing())
                             origin = np.array(img.GetOrigin())
-
+                            # Construct the affine matrix
                             affine = np.eye(4)
                             affine[:3, :3] = direction @ np.diag(spacing)
                             affine[:3, 3] = origin
-
+                            # Store the original affine and shape in the dictionary
                             d[f"{key}_original_affine"] = torch.from_numpy(affine).to(torch.float64)
                             d[f"{key}_original_shape"] = torch.tensor(img.GetSize(), dtype=torch.int32)
 
@@ -290,8 +262,8 @@ class SegmentationDataModule(pl.LightningDataModule):
         self.do_augment = augment
         self.params = params or {}
         self.compute_dtype = compute_dtype
-        self.args = args # Store args to control dataloader logic
-        self._setup_called = False # Guard to prevent multiple setup calls
+        self.args = args # Stores args to control dataloader logic
+        self._setup_called = False # Guards to prevent multiple setup calls
         
         # Memory-optimized settings for large images
         self.num_workers = min(int(self.params.get("NUM_WORKERS", 2)), 4)  # Limit workers for large images
@@ -308,6 +280,7 @@ class SegmentationDataModule(pl.LightningDataModule):
 
         # Disk-backed caching (safe on RAM) using PersistentDataset
         self.use_persistent_dataset = bool(self.params.get("PERSISTENT_DATASET", True))
+        print(f"use_persistent_dataset: {self.use_persistent_dataset}")
         # Transform optimization settings
         self.use_gpu_transforms = bool(self.params.get("USE_GPU_TRANSFORMS", False)) 
         self.cache_rate = float(self.params.get("CACHE_RATE", 0.5))
@@ -316,13 +289,15 @@ class SegmentationDataModule(pl.LightningDataModule):
         if isinstance(self.patch_size, int):
             self.patch_size = (self.patch_size,) * 3
         print(f"Patch size: {self.patch_size}")
-
-        # NEW knobs
         self.use_patch_bank_sampling = bool(self.params.get("USE_PATCH_BANK_SAMPLING", True))
         self.patch_banks_dir = self.params.get("PATCH_BANKS_DIR", str(Path(self.data_path) / "patch_banks"))
         self.sampler_pos_ratio = float(self.params.get("SAMPLER_POS_RATIO", 0.9))
-        self.sampler_temperature = float(self.params.get("SAMPLER_TEMPERATURE", 1.0))
-        self.sampler_fg_threshold = float(self.params.get("SAMPLER_FG_THRESHOLD", 4.72e-05))  # locked q25
+        self.sampler_temperature = float(self.params.get("SAMPLER_TEMPERATURE", 0.7))
+        self.sampler_fg_threshold = float(self.params.get("SAMPLER_FG_THRESHOLD", 1.72e-05))  # locked q25
+        # Landmark-aware sampling knobs (optional)
+        self.sampler_use_landmarks = bool(self.params.get("SAMPLER_USE_LANDMARKS", False))
+        self.sampler_quota_bifurcation = float(self.params.get("SAMPLER_QUOTA_BIFURCATION", 0.0))
+        self.sampler_quota_trachea = float(self.params.get("SAMPLER_QUOTA_TRACHEA", 0.0))
         # Initialize file lists
         self.train_files = []
         self.val_files = []
@@ -442,22 +417,33 @@ class SegmentationDataModule(pl.LightningDataModule):
             EnsureChannelFirstd(keys=img_label_keys, allow_missing_keys=True),
             EnsureTyped(keys=['image', 'lung', 'label'], track_meta=True, allow_missing_keys=True),
         ])
+        # Ensure lung is binary and limited to {0,1} after load to avoid visualization artifacts
+        transforms_list.append(
+            BinarizeLungd(keys=["lung"], allow_missing_keys=True)
+        )
         # IMPORTANT: apply Orientationd before sampling if using RandCrop, but AFTER sampling if using patch-bank
         if not self.use_patch_bank_sampling:
+            print("Applying Orientationd before sampling, not using patch-bank")
             transforms_list.append(
                 Orientationd(keys=img_label_keys, axcodes="RAS", allow_missing_keys=True)
             )
         
-        # Intensity scaling
+        # Intensity scaling - use pixel min/max values from params
+        pixel_min = self.params.get("PIXEL_VALUE_MIN", -1000)
+        pixel_max = self.params.get("PIXEL_VALUE_MAX", 600)
+        norm_min = self.params.get("PIXEL_NORM_MIN", 0.0)
+        norm_max = self.params.get("PIXEL_NORM_MAX", 1.0)
+        
         transforms_list.append(
             ScaleIntensityRanged(
-                keys=["image"], a_min=-1000, a_max=400, b_min=0.0, b_max=1.0, clip=True,
+                keys=["image"], a_min=pixel_min, a_max=pixel_max, b_min=norm_min, b_max=norm_max, clip=True,
             )
         )
 
         if stage=="train":
             # If using patch-bank, avoid CropForegroundd here (we will extract exact ROI positions)
             if not self.use_patch_bank_sampling:
+                print("Applying CropForegroundd, not using patch-bank")
                 transforms_list.append(
                     CropForegroundd(keys=img_label_keys, source_key="lung", allow_missing_keys=True, margin=[1,1,1])
                 )
@@ -470,11 +456,6 @@ class SegmentationDataModule(pl.LightningDataModule):
                 CropForegroundd(keys=img_label_keys, source_key="lung", allow_smaller = True, margin=[1,1,50])
             )
         
-        # If using patch-bank, orient AFTER sampling to keep bank coordinates consistent with raw processed grid
-        if self.use_patch_bank_sampling:
-            transforms_list.append(
-                Orientationd(keys=img_label_keys, axcodes="RAS", allow_missing_keys=True)
-            )
         
         # dtype choice
         if stage == "train" and self.compute_dtype == torch.float16:
@@ -495,7 +476,7 @@ class SegmentationDataModule(pl.LightningDataModule):
         print(f"sampler_temperature: {self.sampler_temperature}")
         print(f"sampler_fg_threshold: {self.sampler_fg_threshold}")
         if stage == "train":
-            # If using patch-bank sampling, do not add SpatialPadd here; we will crop exact patches
+            # If using patch-bank sampling, do not add SpatialPadd here; we will crop exact patches instead in patch-bank sampler
             if not self.use_patch_bank_sampling:
                 transforms.append(
                     SpatialPadd(
@@ -508,6 +489,7 @@ class SegmentationDataModule(pl.LightningDataModule):
                 )
             # Sampler selection
             if self.use_patch_bank_sampling and SamplePatchFromBankd is not None:
+                print("Applying SamplePatchFromBankd, using patch-bank")
                 transforms.append(
                     SamplePatchFromBankd(
                         keys=img_label_keys,
@@ -517,10 +499,18 @@ class SegmentationDataModule(pl.LightningDataModule):
                         pos_ratio=self.sampler_pos_ratio,
                         temperature=self.sampler_temperature,
                         fg_threshold=self.sampler_fg_threshold,
+                        use_landmarks=self.sampler_use_landmarks,
+                        quota_bifurcation=self.sampler_quota_bifurcation,
+                        quota_trachea=self.sampler_quota_trachea,
                         allow_missing_keys=True,
                     )
                 )
+                # Orientation after sampling if using patch-bank, to keep ROI indices consistent with audited frame
+                transforms.append(
+                    Orientationd(keys=img_label_keys, axcodes="RAS", allow_missing_keys=True)
+                )
             else:
+                print("Applying RandCropByPosNegLabeld, not using patch-bank")
                 transforms.append(
                         RandCropByPosNegLabeld(
                             keys=img_label_keys,
@@ -568,21 +558,17 @@ class SegmentationDataModule(pl.LightningDataModule):
 
         print(f"Setting up data module for stage: {stage}...")
         self.get_data_paths()
-
-        # Get transform lists and compose them here to ensure no nesting
         self.deterministic_transforms_list = self.get_deterministic_transforms_list(stage="train")
         self.train_transforms = Compose(self.deterministic_transforms_list + list(self.get_random_transforms(stage="train").transforms))
         
         self.val_transforms = self.get_val_transforms()
-        
-        # For testing, we only want the deterministic part
         self.test_transforms_list = self.get_deterministic_transforms_list(stage="test")
         self.test_transforms = Compose(self.test_transforms_list)
 
         if stage == 'fit' or stage is None:
             # The deterministic transforms for caching must be a Compose object
             deterministic_compose = Compose(self.deterministic_transforms_list)
-            random_compose = self.get_random_transforms(stage="train") # This is already a Compose
+            random_compose = self.get_random_transforms(stage="train") 
 
             if self.cache_dataset: # Fallback to CacheDataset (in-RAM)
                 print("Using CacheDataset to cache deterministic transforms...")
@@ -596,7 +582,6 @@ class SegmentationDataModule(pl.LightningDataModule):
                 self.train_ds = Dataset(data=_cached_deterministic_ds, transform=random_compose)
                 print(f"  - CacheDataset configured. Random transforms will be applied on-the-fly.")
             elif self.use_persistent_dataset:
-                # Safest for OOM: cache deterministic transforms to disk, apply random on-the-fly
                 print("Using PersistentDataset (disk-backed cache) for deterministic transforms...")
                 _persistent_train = PersistentDataset(
                     data=self.train_files,
@@ -605,11 +590,10 @@ class SegmentationDataModule(pl.LightningDataModule):
                 )
                 self.train_ds = Dataset(data=_persistent_train, transform=random_compose)
                 print(f"  - PersistentDataset configured at: {self.cache_dir / 'train'}")
-            else: # No caching at all
+            else:
                 print("Using regular Dataset (no caching).")
                 self.train_ds = Dataset(data=self.train_files, transform=self.train_transforms)
                 
-        # Datasets for validation and prediction/testing stages
         if self.use_persistent_dataset:
             self.val_ds = PersistentDataset(
                 data=self.val_files,
@@ -634,11 +618,9 @@ class SegmentationDataModule(pl.LightningDataModule):
         print("Data module setup complete.")
         if hasattr(self, 'train_ds') and self.train_ds is not None: print(f"Training dataset size: {len(self.train_ds)}")
         if hasattr(self, 'val_ds') and self.val_ds is not None: print(f"Validation dataset size: {len(self.val_ds)}")
-        self._setup_called = True # Set the guard after setup is complete
-        import gc
+        self._setup_called = True     
         gc.collect()
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
     
@@ -691,17 +673,18 @@ class SegmentationDataModule(pl.LightningDataModule):
         )
 
     def train_dataloader(self):
+        """Create training dataloader."""
         return self._create_dataloader(self.train_ds, self.batch_size, shuffle=True, num_workers=self.num_workers)
 
     def val_dataloader(self):
+        """Create validation dataloader."""
         return self._create_dataloader(self.val_ds, self.test_batch_size, shuffle=False, num_workers=1)
 
     def aff_training_val_dataloader(self):
         """Creates a dataloader for the validation split of the training data, used for testing."""
-        # This uses the same validation dataset as val_dataloader but is meant for the final testing phase.
         if not hasattr(self, 'val_ds') or self.val_ds is None:
-            self.setup(stage='fit') # Ensure val_ds is created
-        return self._create_dataloader(self.val_ds, self.test_batch_size, shuffle=False)
+            self.setup(stage='fit') 
+        return self._create_dataloader(self.val_ds, self.test_batch_size, shuffle=False, num_workers=0)
 
     def off_val_dataloader(self):
         """Create official validation dataloader."""
@@ -709,9 +692,7 @@ class SegmentationDataModule(pl.LightningDataModule):
 
     def test_dataloader(self):
         """
-        Returns the appropriate dataloader for the test phase.
-        If metric_testing is enabled, it returns the validation split of the training data (with labels).
-        Otherwise, it returns the official test set (without labels).
+        Returns the appropriate dataloader for the test phase
         """
         # Allow choosing which dataset to iterate
         chosen = (self.args.test_dataset if self.args and hasattr(self.args, 'test_dataset') else 'off_val')

@@ -31,18 +31,9 @@ def detailed_gpu_info():
             f"NVIDIA-SMI: {used_mem} MB used / {total_mem} MB total")
 
 def force_cuda_device(device_id=0):
-    """Force PyTorch to use a specific CUDA device and validate it's working"""
     if not torch.cuda.is_available():
-        print("\n\n========== CRITICAL ERROR: CUDA NOT AVAILABLE ==========")
-        print("Check CUDA installation, drivers, and GPU compatibility.")
-        print("Recommendations:")
-        print("1. Run nvidia-smi to verify GPU is detected")
-        print("2. Check CUDA version compatibility with PyTorch")
-        print("3. Try reinstalling PyTorch with CUDA support: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118")
-        print("==========================================================\n\n")
         raise RuntimeError("CUDA is not available. Training cannot proceed on GPU.")
     
-    # Set environment variables to force GPU usage
     os.environ['CUDA_VISIBLE_DEVICES'] = str(device_id)
     os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
     
@@ -107,11 +98,6 @@ def run_gpu_verification_test(device_id=0, n=1000):
     except Exception as e:
         print(f"\nGPU Test FAILED: {str(e)}")
         print("The GPU is not being utilized correctly.")
-        print("Recommendations:")
-        print("1. Check if CUDA is properly initialized")
-        print("2. Ensure your PyTorch installation includes CUDA")
-        print("3. Verify GPU compatibility with PyTorch")
-        print("==============================================\n")
         return False
 
 def diagnose_model_placement(model):
@@ -150,12 +136,9 @@ def verify_tensor_on_gpu(tensor, tensor_name="Input"):
         return False
 
 def force_model_to_gpu(model, device_id=0):
-    """Force a model to be on GPU, with proper checks"""
     if not torch.cuda.is_available():
         print("CUDA not available! Cannot move model to GPU.")
         return model
-
-    # Accept both torch.device and int
     if isinstance(device_id, torch.device):
         device = device_id
     elif isinstance(device_id, str) and device_id.startswith("cuda"):
@@ -178,7 +161,6 @@ def force_model_to_gpu(model, device_id=0):
     return model
 
 def monitor_gpu_usage(message=""):
-    """Print current GPU memory usage with optional message"""
     if message:
         print(f"=== GPU Usage: {message} ===")
     else:

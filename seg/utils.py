@@ -1,16 +1,15 @@
-import math
+import math, gzip, pickle, os
+from pathlib import Path
 import os
-from typing import Optional
+from typing import Optional, Dict, List, Tuple, Callable
 import numpy as np
 import torch
 from monai.losses import DiceLoss, DiceCELoss, TverskyLoss, MaskedDiceLoss, DiceFocalLoss, GeneralizedDiceLoss
-from .loss_functions import HardclDiceLoss, GeneralUnionLoss, soft_dice_cldice, CBEL
+from .loss_functions import HardclDiceLoss, GeneralUnionLoss, soft_dice_cldice, CBEL , SoftclDiceAdapter, SoftDiceclDiceAdapter, DiceCEPlusSoftclDice
 try:
-    # Use absolute import instead of relative import
     from models.WingsNet import WingsNet
     from models.ResUNet import ResUNet
 except ImportError:
-    # Fallback with improved path handling
     import sys
     import os.path as path
     parent_dir = path.dirname(path.dirname(path.abspath(__file__)))
@@ -20,6 +19,7 @@ except ImportError:
     from models.ResUNet import ResUNet
 from monai.metrics import DiceMetric, MeanIoU
 from torch import nn
+import torch.nn.functional as F
 from monai.networks.nets import BasicUNet, UNet, AttentionUnet
 from monai.utils import set_determinism, MetricReduction, Method
 import random
@@ -27,15 +27,20 @@ import pickle
 import sys
 import nibabel as nib
 from monai.transforms import SpatialResample, get_largest_connected_component_mask
+from scipy.ndimage import label as _ndlabel
+from scipy.ndimage import binary_fill_holes as _fill
+from scipy.ndimage import distance_transform_edt
+try:
+    from scipy.spatial import cKDTree
+except Exception:
+    cKDTree = None
 
+#Set seed 
 random.seed(1221)
 np.random.seed(1221)
 # safer determinism setting to avoid CUDA errors
 try:
-    # Set CUBLAS workspace config for deterministic behavior
     os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':16:8'
-    
-    # Allow non-deterministic algorithms when deterministic implementation is not available
     torch.use_deterministic_algorithms(True, warn_only=True)
     set_determinism(seed=0)
     print("Utils: Using deterministic algorithms with fallback for CUDA compatibility")
@@ -45,6 +50,15 @@ except Exception as e:
     torch.use_deterministic_algorithms(False)
     print(f"Utils: Warning - Using non-deterministic algorithms for CUDA compatibility: {e}")
 
+def keep_topk_components(mask_zyx: np.ndarray, k: int = 2, fill_holes: bool = True) -> np.ndarray:
+    m = (mask_zyx > 0).astype(np.uint8)
+    lab, n = _ndlabel(m)
+    if n <= k: 
+        return _fill(m).astype(np.uint8) if fill_holes else m
+    sizes = np.bincount(lab.ravel()); sizes[0] = 0
+    keep = np.argsort(sizes)[-k:]
+    out = np.isin(lab, keep)
+    return _fill(out).astype(np.uint8) if fill_holes else out.astype(np.uint8)
 
 def estimate_memory_training(model, sample_input, optimizer_type=torch.optim.Adam, batch_size=1, use_amp=False,
                              device=0):
@@ -92,17 +106,6 @@ def estimate_memory_training(model, sample_input, optimizer_type=torch.optim.Ada
 
 
 def estimate_memory_inference(model, sample_input, batch_size=1, use_amp=False, device=0):
-    """Predict the maximum memory usage of the model.
-    Args:
-        optimizer_type (Type): the class name of the optimizer to instantiate
-        model (nn.Module): the neural network model
-        sample_input (torch.Tensor): A sample input to the network. It should be
-            a single item, not a batch, and it will be replicated batch_size times.
-        batch_size (int): the batch size
-        use_amp (bool): whether to estimate based on using mixed precision
-        device (torch.device): the device to use
-    """
-    # Reset model and optimizer
     model.cpu()
     a = torch.cuda.memory_allocated(device)
     model.to(device)
@@ -179,10 +182,7 @@ def get_model(params, device):
     is_training_phase = params.get('TRAINING_PHASE', True)
     
     if params['MODEL_NAME'] == 'ResUNet':
-        # Use the new ResUNet implementation with attention gates
         from monai.networks.layers.factories import Act, Norm
-        
-        # Convert string norm to enum if needed
         norm_type = params.get('NORM', 'INSTANCE')
         if isinstance(norm_type, str):
             norm_enum = getattr(Norm, norm_type.upper(), Norm.INSTANCE)
@@ -195,7 +195,7 @@ def get_model(params, device):
             out_channels=params.get('OUT_CHANNELS', 1),
             channels=params.get('CHANNELS', 16),
             strides=params.get('STRIDES', 2),
-            num_res_units=params.get('NUM_RES_UNITS', 1),  # Not used in new implementation but kept for compatibility
+            num_res_units=params.get('NUM_RES_UNITS', 1),  
             norm=norm_enum,
             act=Act.RELU,  # Default to ReLU
             dropout=params.get('DROPOUT', 0.1),
@@ -268,7 +268,7 @@ def get_model(params, device):
             channels=channels,
             strides=strides,
             kernel_size=3,
-            dropout=params['DROPOUT']
+            dropout=0.0
         )
         print(f"Created AttentionUNet with channels={channels}, strides={strides}")
         
@@ -295,8 +295,6 @@ def get_model(params, device):
 def get_loss(l_name='DiceLoss', params: Optional[dict] = None, include_background=True, to_onehot_y=False, sigmoid=True, softmax=False):
     if params is None:
         params = {}
-
-    # Extract common MONAI loss params, allow overrides from specific loss logic if needed
     loss_kwargs = {
         "include_background": include_background,
         "to_onehot_y": to_onehot_y,
@@ -308,7 +306,6 @@ def get_loss(l_name='DiceLoss', params: Optional[dict] = None, include_backgroun
         case 'DiceLoss':
             return DiceLoss(**loss_kwargs)
         case 'GeneralizedDiceLoss':
-            # Recommended for imbalanced data, focuses on foreground
             print("Using GeneralizedDiceLoss")
             loss_kwargs['include_background'] = False
             return GeneralizedDiceLoss(**loss_kwargs)
@@ -360,6 +357,29 @@ def get_loss(l_name='DiceLoss', params: Optional[dict] = None, include_backgroun
             cbel_kwargs["alpha"] = params.get("alpha", [0.2, 0.1]) 
             cbel_kwargs["rl"] = params.get("rl", [0.8, 0.5])
             return CBEL(**cbel_kwargs)
+        case 'SoftclDiceLoss':
+            return SoftclDiceAdapter(
+                iter_=int(params.get("iter_", int(os.getenv('CLDICE_ITER', '3')))),
+                smooth=float(params.get("smooth", float(os.getenv('CLDICE_SMOOTH', '1.0'))))
+            )
+        case 'SoftDiceclDiceLoss':
+            return SoftDiceclDiceAdapter(
+                iter_=int(params.get("iter_", int(os.getenv('CLDICE_ITER', '3')))),
+                alpha=float(params.get("alpha", float(os.getenv('CLDICE_ALPHA', '0.5')))),
+                smooth=float(params.get("smooth", float(os.getenv('CLDICE_SMOOTH', '1.0'))))
+            )
+        case 'DiceCEPlusSoftclDice' | 'DiceCE+SoftclDice':
+            return DiceCEPlusSoftclDice(
+                include_background=include_background,
+                to_onehot_y=to_onehot_y,
+                sigmoid=sigmoid,
+                softmax=softmax,
+                lambda_dice=float(params.get("lambda_dice", float(os.getenv('DICECE_LAMBDA_DICE', '1.0')))),
+                lambda_ce=float(params.get("lambda_ce", float(os.getenv('DICECE_LAMBDA_CE', '0.5')))),
+                cl_weight=float(os.getenv('CLDICE_WEIGHT', '0.3')),
+                cl_iter=int(os.getenv('CLDICE_ITER', '3')),
+                cl_smooth=float(os.getenv('CLDICE_SMOOTH', '1.0')),
+            )
         case _:
             raise ValueError(f"Unknown loss function: {l_name}")
 
@@ -437,31 +457,28 @@ def save_val_2path(output_p: str, type_p: str, f_name: str, tensor: torch.Tensor
 
 def get_lcc(pred: np.ndarray) -> np.ndarray:
     """
-    Get the largest connected component from a binary mask using MONAI.
-    
-    Args:
-        pred: The binary prediction mask as a NumPy array.
-        
-    Returns:
-        The largest connected component of the mask.
+    Keep the largest 3-D connected component and fill holes.
+    Works for np.ndarray or torch.Tensor with shape [Z,Y,X] (or [1,Z,Y,X]).
     """
-    # Ensure pred is a numpy array
+    # to numpy
     if isinstance(pred, torch.Tensor):
-        pred = pred.cpu().numpy()
-    
-    # Ensure we pass a 3-D volume to skimage (it only supports 1-3 D).
-    # If a singleton leading axis exists, drop it; otherwise keep as-is.
-    while pred.ndim > 3 and pred.shape[0] == 1:
-        pred = np.squeeze(pred, axis=0)
+        pred = pred.detach().cpu().numpy()
 
-    if pred.ndim > 3:
-        raise ValueError(
-            f"get_lcc expects <=3-D mask per sample, got shape {pred.shape}."
-        )
+    vol = np.squeeze(pred) > 0          # [Z,Y,X] boolean
+    if vol.ndim != 3:
+        raise ValueError(f"get_lcc expects a 3-D mask, got {vol.shape}")
 
-    lcc_mask = get_largest_connected_component_mask(pred)
+    # Add batch dimension so MONAI treats it as one 3-D sample
+    # and uses 3-D connectivity (connectivity defaults to ndim=3).
+    vol_batched = vol[None, ...]        # [1,Z,Y,X]
+    mask_batched = get_largest_connected_component_mask(vol_batched, connectivity=3)
+    lcc = np.asarray(mask_batched)[0]   # back to [Z,Y,X]
 
-    return lcc_mask.astype(np.uint8)
+    if os.getenv("FILL_HOLES", "True").lower() == "true":
+        lcc = binary_fill_holes(lcc).astype(np.uint8)
+    else:
+        lcc = lcc.astype(np.uint8)
+    return lcc
 
 
 def remove_small_components(pred: np.ndarray, min_size: int = 64) -> np.ndarray:
@@ -555,124 +572,173 @@ def get_folder_names(dataset):
     else:
         raise ValueError("Unsupported dataset type. Choose from 'AIIB23', 'ATM22', or 'AeroPath'.")
 
+def load_patch_bank_for_case(case_id: str, patch_banks_dir: str | Path):
+    """Return (patch_list, meta_dict) or (None, None) if missing."""
+    bank_path = Path(patch_banks_dir) / f"{case_id}.pkl.gz"
+    if not bank_path.exists():
+        return None, None
+    with gzip.open(str(bank_path), "rb") as f:
+        obj = pickle.load(f)
+    if isinstance(obj, dict) and "patch_descriptors" in obj:
+        return obj["patch_descriptors"], obj.get("metadata", {})
+    return obj, {}
 
-# def resample_and_save_nifti(data_to_save: np.ndarray,
-#                               source_affine: np.ndarray,
-#                               target_affine: np.ndarray,
-#                               target_shape: tuple,
-#                               output_filename: str,
-#                               mode: str = 'nearest',
-#                               original_header=None):
-#     """
-#     Resamples a NumPy array to a target space defined by target_affine and target_shape,
-#     then saves it as a NIfTI image.
+def extract_case_id_from_meta(batch_meta: dict) -> str:
+    """get the case id from MONAI meta."""
+    v = None
+    if isinstance(batch_meta, dict):
+        v = batch_meta.get("filename_or_obj")
+        if isinstance(v, (list, tuple)) and v:
+            v = v[0]
+    if isinstance(v, (str, Path)):
+        return Path(v).stem
+    return "unknown"
 
-#     Args:
-#         data_to_save: The NumPy array data to resample and save.
-#         source_affine: The affine matrix of the data_to_save.
-#         target_affine: The desired affine matrix for the output NIfTI file.
-#         target_shape: The desired spatial shape for the output NIfTI file.
-#         output_filename: Path to save the resampled NIfTI image.
-#         mode: Interpolation mode ('nearest', 'bilinear', 'trilinear', etc.).
-#         original_header: Optional original NIfTI header to use for the new file.
-#                          If provided, its data dtype will be updated.
-#     """
-#     if not isinstance(data_to_save, np.ndarray):
-#         raise ValueError("data_to_save must be a NumPy array.")
+def _sliding_window_starts(shape_zyx: Tuple[int, int, int],
+                           roi_zyx: Tuple[int, int, int],
+                           overlap: float) -> List[Tuple[int, int, int]]:
+    # step per dim per MONAI logic: floor(roi_size * (1 - overlap)), at least 1 voxel
+    steps = [max(1, int(r * (1.0 - float(overlap)))) for r in roi_zyx]
+    ranges = []
+    for dim, r, st in zip(shape_zyx, roi_zyx, steps):
+        last = max(0, dim - r)
+        idxs = list(range(0, max(1, dim - r + 1), st))
+        if not idxs or idxs[-1] != last:
+            idxs.append(last)
+        ranges.append(idxs)
+    starts = [(z, y, x) for z in ranges[0] for y in ranges[1] for x in ranges[2]]
+    return starts
 
-#     # Ensure data is float32 for resampling, can be cast later
-#     img_tensor = torch.tensor(data_to_save.astype(np.float32)).unsqueeze(0)  # Add batch dim (B,H,W,D)
-#     if img_tensor.ndim == 4: # if it's (B, H, W, D), needs to be (B, C, H, W, D) for MONAI
-#         img_tensor = img_tensor.unsqueeze(1) # Add channel dim -> (B, C, H, W, D)
-#     elif img_tensor.ndim == 5: # Already (B,C,H,W,D)
-#         pass
-#     else:
-#         raise ValueError(f"Input data has unexpected ndim: {img_tensor.ndim}")
+def _gaussian_importance_map(roi_zyx: Tuple[int, int, int], device: torch.device) -> torch.Tensor:
+    """Simple separable Gaussian window centered in ROI, max=1.0 (like MONAI's)."""
+    z, y, x = [int(v) for v in roi_zyx]
+    def g(n):
+        t = torch.linspace(-1, 1, n, device=device)
+        return torch.exp(-0.5 * (t / 0.3) ** 2)  # sigma ~ 0.3 of half-width
+    wz, wy, wx = g(z), g(y), g(x)
+    win = wz[:, None, None] * wy[None, :, None] * wx[None, None, :]
+    win /= win.max()
+    return win  # (Z,Y,X)
 
-#     # Create a Resample transform instance
-#     # We need to provide MONAI with the source image's affine.
-#     # MONAI's Resample transform by default assumes the input tensor's affine is identity.
-#     # To correctly resample from a known source affine to a target affine/shape,
-#     # we need to ensure the input tensor carries its affine information or the transform
-#     # is configured to understand it.
-#     # A common way is to create a MetaTensor.
-#     from monai.data import MetaTensor
-#     # Create a MetaTensor from the input tensor and its source affine
-#     # The Resample transform will use this source affine.
-#     img_metatensor = MetaTensor(img_tensor, affine=torch.tensor(source_affine, dtype=torch.float32))
+def make_audit_weight_provider(patch_list: List[Dict],
+                               roi_zyx: Tuple[int, int, int]) -> Callable[[Tuple[int,int,int]], float]:
+    """Return f(start_zyx)-> normalized weight using nearest audited patch."""
+    positions = np.array([p.get("position_zyx", p.get("position", (0,0,0))) for p in patch_list],
+                         dtype=np.int32)
+    weights = np.array([float(p.get("sampling_weight", 1.0)) for p in patch_list], dtype=np.float32)
+    if len(positions) == 0:
+        return lambda *_: 1.0
+    if cKDTree is not None:
+        tree = cKDTree(positions)
+        def _provider(start):
+            _, idx = tree.query(np.asarray(start), k=1)
+            return float(weights[int(idx)])
+    else:
+        def _provider(start):
+            d2 = ((positions - np.asarray(start)) ** 2).sum(axis=1)
+            idx = int(np.argmin(d2))
+            return float(weights[idx])
+    mean_w = float(weights.mean()) if weights.size else 1.0
+    mean_w = 1.0 if mean_w <= 0 else mean_w
+    return lambda s: _provider(s) / mean_w
 
+def make_landmark_weight_provider_from_bank(patch_list: List[Dict],
+                                            vol_shape_zyx: Tuple[int,int,int],
+                                            roi_zyx: Tuple[int,int,int],
+                                            spacing_zyx_mm: Optional[Tuple[float,float,float]] = None,
+                                            sigma_mm: float = 30.0) -> Callable[[Tuple[int,int,int]], float]:
+    """
+    Seed trachea/bifurcation centers from bank flags, build distance maps,
+    return w(start) = exp(-min(D_trach, D_bif)/sigma) normalized by case mean.
+    """
+    dz, dy, dx = [int(v) for v in roi_zyx]
+    # collect patch centers for flagged descriptors
+    tr_centers, bif_centers = [], []
+    for p in patch_list:
+        z, y, x = [int(v) for v in p.get("position_zyx", p.get("position", (0,0,0)))]
+        cz, cy, cx = z + dz//2, y + dy//2, x + dx//2
+        if bool(p.get("is_trachea", False)):
+            tr_centers.append((cz, cy, cx))
+        if bool(p.get("is_bifurcation", False)):
+            bif_centers.append((cz, cy, cx))
+    if not tr_centers and not bif_centers:
+        return lambda *_: 1.0  # no landmark info → uniform
 
-#     # Create a dummy MetaTensor that defines the target space (affine and shape)
-#     # This is not strictly necessary if dst_affine and spatial_size are used directly,
-#     # but 'like' can be more robust.
-#     # However, for simplicity and directness, we'll use dst_affine and spatial_size.
-    
-#     resampler = SpatialResample(mode=mode, padding_mode='zeros', align_corners=False, dtype=img_metatensor.dtype)
+    seeds_tr = np.zeros(vol_shape_zyx, dtype=np.uint8)
+    seeds_bf = np.zeros(vol_shape_zyx, dtype=np.uint8)
+    for (cz, cy, cx) in tr_centers:
+        if 0 <= cz < vol_shape_zyx[0] and 0 <= cy < vol_shape_zyx[1] and 0 <= cx < vol_shape_zyx[2]:
+            seeds_tr[cz, cy, cx] = 1
+    for (cz, cy, cx) in bif_centers:
+        if 0 <= cz < vol_shape_zyx[0] and 0 <= cy < vol_shape_zyx[1] and 0 <= cx < vol_shape_zyx[2]:
+            seeds_bf[cz, cy, cx] = 1
 
-#     # Resample the image.
-#     # The Resample transform needs the target affine and shape.
-#     # It's important that the target_affine is compatible with the target_shape.
-#     # The `dst_affine` parameter in Resample is what we need.
-#     # It will resample the `img_metatensor` (which knows its own `source_affine`)
-#     # to the space defined by `dst_affine` and `spatial_size`.
-    
-#     # Ensure target_affine is a tensor
-#     target_affine_tensor = torch.tensor(target_affine, dtype=torch.float32)
+    # Distance in mm if spacing is known; otherwise in voxels.
+    sampling = spacing_zyx_mm if (spacing_zyx_mm is not None) else None
+    Dtr = distance_transform_edt(1 - seeds_tr, sampling=sampling)
+    Dbf = distance_transform_edt(1 - seeds_bf, sampling=sampling)
+    Dmin = np.minimum(Dtr, Dbf)
 
-#     # Ensure target_shape is a tuple of ints
-#     if isinstance(target_shape, torch.Size):
-#         target_shape_tuple = tuple(target_shape)
-#     elif isinstance(target_shape, (list, np.ndarray)):
-#         target_shape_tuple = tuple(int(s) for s in target_shape)
-#     elif isinstance(target_shape, tuple):
-#         target_shape_tuple = tuple(int(s) for s in target_shape)
-#     else:
-#         raise ValueError(f"target_shape must be a tuple, list, np.ndarray, or torch.Size, got {type(target_shape)}")
+    if spacing_zyx_mm is None:
+        sigma = float(sigma_mm)  # interpret as "voxels" if spacing unknown
+    else:
+        # use mean spacing to keep it simple; sigma_mm is isotropic
+        sigma = float(sigma_mm)
 
-#     # Pass img_metatensor[0] (C,H,W,D) to the resampler because the functional version
-#     # being used expects (C,H,W,D) and applies an unconditional unsqueeze(0).
-#     resampled_chwd = resampler(img_metatensor[0], dst_affine=target_affine_tensor, spatial_size=target_shape_tuple)
-#     # Restore the batch dimension.
-#     resampled_tensor = resampled_chwd.unsqueeze(0)
-    
-#     resampled_np = resampled_tensor.cpu().numpy().squeeze() # Remove Batch and Channel if they are 1
+    def raw_w(start):
+        # weight at window center
+        cz, cy, cx = start[0] + dz//2, start[1] + dy//2, start[2] + dx//2
+        cz = min(max(cz, 0), vol_shape_zyx[0]-1)
+        cy = min(max(cy, 0), vol_shape_zyx[1]-1)
+        cx = min(max(cx, 0), vol_shape_zyx[2]-1)
+        return float(np.exp(- Dmin[cz, cy, cx] / (sigma + 1e-8)))
+    # normalize by mean over all starts (computed lazily by caller for efficiency)
+    return raw_w
 
-#     # Cast to appropriate dtype after resampling
-#     if mode == 'nearest': # Typically for segmentations
-#         resampled_np = resampled_np.astype(np.uint8)
-#     else: # Typically for probabilities
-#         resampled_np = resampled_np.astype(np.float32)
+# ---- main: weighted sliding-window inference --------------------------------
+@torch.no_grad()
+def weighted_sliding_window_inference(
+    inputs: torch.Tensor,                     # [B=1, C, Z, Y, X]
+    predictor,                                # model.forward
+    roi_size: Tuple[int,int,int],
+    overlap: float,
+    per_window_weight: Callable[[Tuple[int,int,int]], float],
+    device: Optional[torch.device] = None,
+    gaussian_blend: bool = True,
+) -> torch.Tensor:
+    """
+    Inspired from MONAI's function but adds a scalar per-window weight.
+    Accumulates: sum_logits += w_i * G * logits_i; sum_w += w_i * G.
+    """
+    assert inputs.ndim == 5 and inputs.shape[0] == 1, "supports B=1 for simplicity"
+    device = device or inputs.device
+    _, _, Z, Y, X = inputs.shape
+    roi_zyx = tuple(int(v) for v in roi_size)
+    starts = _sliding_window_starts((Z, Y, X), roi_zyx, overlap)
 
-#     # # Prepare header
-#     # header_to_save = None
-#     # if original_header is not None:
-#     #     header_to_save = original_header.copy()
-#     #     header_to_save.set_data_dtype(resampled_np.dtype)
-#     #     # Update shape in header if possible (some headers might not store it directly like this)
-#     #     header_to_save.set_data_shape(resampled_np.shape)
+    imp = _gaussian_importance_map(roi_zyx, device) if gaussian_blend else torch.ones(roi_zyx, device=device)
+    imp = imp.clamp_min(1e-6)[None, None, ...]  # [1,1,z,y,x]
 
+    sum_logits = torch.zeros((1, 1, Z, Y, X), dtype=torch.float32, device=device)
+    sum_w = torch.zeros_like(sum_logits)
 
-#     # # Create NIfTI image with the target_affine
-#     # nifti_img = nib.Nifti1Image(resampled_np, target_affine, header_to_save)
-    
-#     # # Ensure directory exists
-#     # os.makedirs(os.path.dirname(output_filename), exist_ok=True)
-    
-#     # print(f"Resampling to shape {target_shape} and saving to {output_filename} ...", end="")
-#     # nib.save(nifti_img, output_filename)
-#     # print("done.")
-#     # Prepare header
-#     header_to_save = None
-#     if original_header is not None:
-#         header_to_save = original_header.copy()
-#         header_to_save.set_data_dtype(resampled_np.dtype)
-#         # Update shape in header if possible (some headers might not store it directly like this)
-#         header_to_save.set_data_shape(resampled_np.shape)
+    # To normalize w_i by case mean, collect once:
+    with torch.no_grad():
+        w_list = [float(per_window_weight(s)) for s in starts]
+    mean_w = float(np.mean(w_list)) if len(w_list) else 1.0
+    mean_w = 1.0 if mean_w <= 0 else mean_w
 
-#     # Create NIfTI image with the target_affine - no orientation transform applied
-#     os.makedirs(os.path.dirname(output_filename), exist_ok=True)
-#     print(f"Resampling to shape {target_shape} and saving to {output_filename} ...", end="")
-#     nifti_img = nib.Nifti1Image(resampled_np, target_affine, header_to_save)
-#     nib.save(nifti_img, output_filename)
-#     print("done.")
+    for s, w_raw in zip(starts, w_list):
+        z, y, x = s
+        z2, y2, x2 = z + roi_zyx[0], y + roi_zyx[1], x + roi_zyx[2]
+        tile = inputs[..., z:z2, y:y2, x:x2]  # [1,C,rz,ry,rx]
+        logits = predictor(tile)              # [1,1,rz,ry,rx] (assume 1‑ch out)
 
+        w = float(w_raw) / mean_w             # case‑normalized
+        wmap = (w * imp).to(logits.dtype)     # [1,1,rz,ry,rx]
+
+        sum_logits[..., z:z2, y:y2, x:x2] += wmap * logits
+        sum_w[..., z:z2, y:y2, x:x2] += wmap
+
+    out = sum_logits / (sum_w + 1e-6)
+    return out  # logits

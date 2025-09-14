@@ -40,7 +40,7 @@ echo "------------------------------------------------------------"
 # Clean up Persistent cache 
 PERSISTENT_CACHE_DIR_PATH="./ATM22/npy_files/persistent_cache" # Define it once
 SHOULD_CLEAN_CACHE=${CLEAN_CACHE:-false} # Default to false, set CLEAN_CACHE=true env var to clear
-
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:128"
 echo "Persistent cache directory: $PERSISTENT_CACHE_DIR_PATH"
 if [ "$SHOULD_CLEAN_CACHE" = true ]; then
     echo "CLEAN_CACHE is true. Ensuring Persistent cache directory exists and is clean."
@@ -57,6 +57,11 @@ else
     mkdir -p "$PERSISTENT_CACHE_DIR_PATH" # Ensure it exists
 fi
 
+if [ -f config.env ]; then
+  set -a
+  source config.env
+  set +a
+fi
 
 SKEL_DIR_PATH="./ATM22/npy_files/skeletons"
 REGIONS_DIR_PATH="./ATM22/npy_files/regions"
@@ -64,42 +69,26 @@ echo "Ensuring skeleton directory exists: $SKEL_DIR_PATH"
 mkdir -p "$SKEL_DIR_PATH"
 echo "Ensuring regions directory exists: $REGIONS_DIR_PATH"
 mkdir -p "$REGIONS_DIR_PATH"
-
+    # --lr 3e-4 \
+    # --resume_from_checkpoint outputs/DiceLoss_ATM22_9_4_12_AttentionUNet_prtrFalse_AdamW_128_b1_p10_0.0001_alpha0.3_r_d1.0r_l0.7WarmupCosineSchedule/model/best_metric_model_28-0.2571.ckpt \
+    # --finetune_from outputs/DiceLoss_ATM22_9_4_12_AttentionUNet_prtrFalse_AdamW_128_b1_p10_0.0001_alpha0.3_r_d1.0r_l0.7WarmupCosineSchedule/model/best_metric_model_28-0.2571.ckpt \
 echo "------------------------------------------------------------"
 echo "Memory usage before training: $(free -h)"
 echo "Executing Python script: python -m seg.training"
 python -m seg.training \
     --dataset ATM22 \
-    --model_name AttentionUNet \
+    --model_name BasicUNet \
     --patch_size 128 \
-    --loss_func DiceLoss \
+    --lr 0.00005 \
+    --loss_func DiceCEPlusSoftclDice \
+    --resume_from_checkpoint outputs/DiceCEPlusSoftclDice_ATM22_9_11_19_BasicUNet_prtrFalse_AdamW_128_b1_p4_0.0001_alpha0.3_r_d1.0r_l0.7WarmupCosineSchedule/model/best_metric_model_38-0.6672.ckpt \
     --optimizer AdamW \
-    --num_workers 1 \
-    --resume_from_checkpoint "outputs/DiceLoss_ATM22_8_24_16_AttentionUNet_prtrFalse_AdamW_128_b1_p7_0.0001_alpha0.3_r_d1.0r_l0.7WarmupCosineSchedule/model/best_metric_model_23-0.2383.ckpt" \
-    --finetune_from "outputs/DiceLoss_ATM22_8_24_16_AttentionUNet_prtrFalse_AdamW_128_b1_p7_0.0001_alpha0.3_r_d1.0r_l0.7WarmupCosineSchedule/model/best_metric_model_23-0.2383.ckpt" \
+    --num_workers 0 \
+    --batch_size 1 \
     --scheduler WarmupCosineSchedule \
-    --lr 3e-5 \
     --mixed \
     --training \
     --max_epochs 50
-
-# Option 2: No cache (uncomment this and comment above if still OOM)
-# python -m seg.training \
-#     --dataset ATM22 \
-#     --model_name AttentionUNet \
-#     --optimizer AdamW \
-#     --lr 0.0003 \
-#     --mixed \
-#     --training \
-#     --max_epochs 100 \
-#     --loss_func TverskyLoss \
-#     --alpha 0.2 \
-#     --batch_size 2\
-#     --out_channels 1 \
-#     --dropout 0.2 \
-#     --patch_size 96 \
-#     --num_workers 0 \
-#     --prefetch_factor 1
 
 # --gradient_checkpointing \
 # Capture the exit code of your Python script

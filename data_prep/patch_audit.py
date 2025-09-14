@@ -9,6 +9,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from tqdm import tqdm
 from scipy import ndimage
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 # skan (optional) for accurate skeleton geodesic lengths
 try:
     from skan.csr import Skeleton  # type: ignore
@@ -62,12 +64,14 @@ def _generate_patch_positions(shape_zyx: Tuple[int, int, int], patch_size: Tuple
 
 
 def _extract_patch(volume_zyx: np.ndarray, start_zyx: Tuple[int, int, int], patch_size: Tuple[int, int, int]) -> np.ndarray:
+    # Extract a patch from a 3D volume given start coordinates and patch size
     z0, y0, x0 = start_zyx
     dz, dy, dx = patch_size
     return volume_zyx[z0:z0+dz, y0:y0+dy, x0:x0+dx]
 
 
 def _entropy(probs: np.ndarray, eps: float = 1e-12) -> float:
+    # Compute entropy of a probability distribution
     p = probs[(probs > 0) & np.isfinite(probs)]
     if p.size == 0:
         return 0.0
@@ -78,7 +82,7 @@ class PatchBankManager:
     def __init__(self) -> None:
         pass
     def save_patch_bank(self, patch_bank: List[Dict], output_path: Path) -> None:
-        # Try to infer patch_size/stride from any descriptor, else leave None
+        # infer patch_size/stride from any descriptor, else leave None
         inferred_ps = None
         inferred_stride = None
         # Look for optional hints in descriptors
@@ -86,13 +90,14 @@ class PatchBankManager:
             if isinstance(p.get("position_zyx"), (list, tuple)):
                 # position alone doesn't encode size; use auditor's defaults if embedded later
                 pass
+        # Metadata
         meta = {
             "total_patches": len(patch_bank),
             "fg_patches": int(sum(1 for p in patch_bank if p.get("fg_fraction", 0.0) > 0.0)),
-            # These fields may be filled by caller context if present
             "patch_size": getattr(self, "_patch_size", None),
             "stride": getattr(self, "_stride", None),
         }
+        # Save as compressed pickle
         bank = {"patch_descriptors": patch_bank, "metadata": meta}
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with gzip.open(str(output_path), "wb") as f:
@@ -108,21 +113,24 @@ class PatchAuditSystem:
         max_patches_per_case: Optional[int] = None,
         use_skan: bool = False,
     ) -> None:
+    # Initialize the PatchAuditSystem with parameters
         self.patch_size = patch_size
         self.stride = stride
         self.min_lung_coverage = float(min_lung_coverage)
         self.max_patches_per_case = max_patches_per_case
-        self.use_skan = bool(use_skan)
+        self.use_skan = bool(use_skan)    
+        self.RAD_Q50, self.RAD_Q95, self.RAD_Q99 = 0.725, 2.791, 4.808  # distal / subseg / seg / main
 
-    # ---- Descriptors start here ----
+    # ---- Descriptors ----
     def compute_fg_fraction_unweighted(self, label_patch: np.ndarray) -> float:
+        # This function computes the unweighted foreground fraction of the patch, i.e., the ratio of foreground voxels to total voxels.
         total = float(label_patch.size)
         if total <= 0:
             return 0.0
         return float((label_patch > 0).sum()) / total
 
     def compute_fg_fraction_center_weighted(self, label_patch: np.ndarray) -> float:
-        #computes the fg fraction of the patch weighted by the distance from the center of the patch
+        #this function computes the fg fraction of the patch weighted by the distance from the center of the patch, giving more importance to voxels closer to the center.
         if (label_patch > 0).sum() == 0:
             return 0.0
         zc, yc, xc = np.array(label_patch.shape) // 2
@@ -135,6 +143,7 @@ class PatchAuditSystem:
         return wf / wt
 
     def compute_components_metrics(self, label_patch: np.ndarray) -> Dict[str, float]:
+        # Connected components metrics: count, LCC fraction, size entropy, using 26-connectivity for 3D. 
         fg = (label_patch > 0).astype(np.uint8)
         if fg.sum() == 0:
             return {
@@ -142,7 +151,7 @@ class PatchAuditSystem:
                 "lcc_fraction": 0.0,
                 "size_entropy": 0.0,
             }
-        # Use 26-connectivity for 3D airways
+        # Using 26-connectivity for 3D airways
         lab, num = ndimage.label(fg, structure=ndimage.generate_binary_structure(3, 3))
         sizes = np.bincount(lab.ravel())
         sizes = sizes[1:] if sizes.size > 0 else sizes  # drop background
@@ -156,6 +165,7 @@ class PatchAuditSystem:
         }
 
     def compute_border_touch_fraction(self, label_patch: np.ndarray) -> float:
+        # Fraction of foreground voxels touching the patch border
         fg = (label_patch > 0)
         if not fg.any():
             return 0.0
@@ -171,6 +181,7 @@ class PatchAuditSystem:
         return float(touch) / float(fg.sum())
 
     def compute_skeleton_and_radii(self, label_patch: np.ndarray, spacing_zyx_mm: Optional[Tuple[float, float, float]]) -> Dict[str, float]:
+        # Skeletonization and inscribed-sphere radii metrics, with optional spacing for physical units (mm)
         fg = (label_patch > 0).astype(np.uint8)
         if fg.sum() == 0:
             return {
@@ -228,6 +239,7 @@ class PatchAuditSystem:
         }
 
     def compute_topology_metrics(self, label_patch: np.ndarray) -> Dict[str, float]:
+        # Topology metrics from skeleton: endpoint count, bifurcation count, branch density, composite topology score. 
         fg = (label_patch > 0).astype(np.uint8)
         if fg.sum() == 0:
             return {
@@ -247,7 +259,9 @@ class PatchAuditSystem:
         # 26-connectivity kernel and exclude self by subtracting 1
         kernel = np.ones((3, 3, 3), dtype=np.float32)
         nb = ndimage.convolve(skel.astype(np.float32), kernel, mode="constant", cval=0.0)
+        # Count neighbors on skeleton excluding self
         nb_on_skel = nb[skel > 0] - 1.0
+        # Clamp to [0, 26] to avoid spurious negatives
         nb_on_skel = np.clip(nb_on_skel, 0.0, 26.0)
         endpoints = int((nb_on_skel == 1).sum())
         branches = int((nb_on_skel >= 3).sum())
@@ -262,7 +276,108 @@ class PatchAuditSystem:
             "topology_score": float(topology_score),
         }
 
+    def compute_landmark_masks(
+        self,
+        label_volume: np.ndarray,
+        lung_volume: Optional[np.ndarray],
+        spacing_zyx_mm: Optional[Tuple[float, float, float]],
+    ) -> Dict[str, np.ndarray]:
+        """
+        Compute coarse anatomical landmark masks on the full volume with memory-safe ops:
+        - bifurcation_mask: skeleton voxels with branching degree >= 3 (1-voxel dilation)
+        - trachea_mask: large-radius skeleton voxels (>= RAD_Q95) in superior 20% lung extent (2-voxel dilation)
+
+        Implementation notes:
+        - Restrict computations to lung/label bounding box to reduce memory.
+        - Compute distance transform only in superior region to identify trachea/main bronchi.
+        """
+        shp = tuple(label_volume.shape)
+        out = {
+            "bifurcation_mask": np.zeros(shp, dtype=bool),
+            "trachea_mask": np.zeros(shp, dtype=bool),
+        }
+        # Define ROI bbox from lung if available, else from label
+        if lung_volume is not None and lung_volume.shape == label_volume.shape and (lung_volume > 0).any():
+            nz = np.where(lung_volume > 0)
+        else:
+            nz = np.where(label_volume > 0)
+        if len(nz[0]) == 0:
+            return out
+        zmin, zmax = int(np.min(nz[0])), int(np.max(nz[0]))
+        ymin, ymax = int(np.min(nz[1])), int(np.max(nz[1]))
+        xmin, xmax = int(np.min(nz[2])), int(np.max(nz[2]))
+        # Pad bbox by 1 voxel within bounds
+        z0, z1 = max(0, zmin - 1), min(shp[0] - 1, zmax + 1)
+        y0, y1 = max(0, ymin - 1), min(shp[1] - 1, ymax + 1)
+        x0, x1 = max(0, xmin - 1), min(shp[2] - 1, xmax + 1)
+
+        # Crop volumes to bbox
+        fg_crop = (label_volume[z0:z1 + 1, y0:y1 + 1, x0:x1 + 1] > 0).astype(np.uint8)
+        if fg_crop.sum() == 0:
+            return out
+
+        # Skeletonize cropped FG
+        try:
+            skel_crop = _skeletonize_3d_safe(fg_crop)
+        except Exception:
+            return out
+        if skel_crop.sum() == 0:
+            # No skeleton -> no landmarks
+            return out
+
+        # Bifurcation mask within crop
+        kernel = np.ones((3, 3, 3), dtype=np.float32)
+        nb = ndimage.convolve(skel_crop.astype(np.float32), kernel, mode="constant", cval=0.0)
+        nb_minus_self = np.clip(nb - 1.0, 0.0, 26.0)
+        bif_crop = (skel_crop > 0) & (nb_minus_self >= 3.0)
+        bif_crop = ndimage.binary_dilation(bif_crop, iterations=1)
+
+        # Scatter to full-size mask
+        out["bifurcation_mask"][z0:z1 + 1, y0:y1 + 1, x0:x1 + 1] = bif_crop
+
+        # Trachea/main bronchi proxy within superior portion of bbox
+        # Determine superior extent from lung if available
+        if lung_volume is not None and lung_volume.shape == label_volume.shape and (lung_volume > 0).any():
+            z_inds = np.where(lung_volume.max(axis=(1, 2)) > 0)[0]
+            if z_inds.size > 0:
+                zmin_l, zmax_l = int(z_inds.min()), int(z_inds.max())
+            else:
+                zmin_l, zmax_l = z0, z1
+        else:
+            zmin_l, zmax_l = z0, z1
+        z_extent = max(1, zmax_l - zmin_l + 1)
+        # Expand superior region to capture main bronchi; was 20%, now 35%
+        top_frac = 0.35
+        top_end = zmin_l + max(1, int(top_frac * z_extent))
+
+        # Restrict EDT to top region of the crop to save memory
+        top0 = z0
+        top1 = min(z1, top_end)
+        top_slice = slice(max(z0, zmin_l), top1 + 1)
+        fg_top = (label_volume[top_slice, y0:y1 + 1, x0:x1 + 1] > 0).astype(np.uint8)
+        try:
+            if spacing_zyx_mm is not None:
+                edt_top = ndimage.distance_transform_edt(fg_top > 0, sampling=spacing_zyx_mm)
+            else:
+                edt_top = ndimage.distance_transform_edt(fg_top > 0)
+        except Exception:
+            edt_top = np.zeros_like(fg_top, dtype=float)
+        # Large-radius threshold: be less strict than RAD_Q95; fallback if none found
+        thr_primary = max(self.RAD_Q50, 0.8 * self.RAD_Q95)
+        rel_start = max(0, top_slice.start - z0)
+        rel_stop = max(rel_start, top_slice.stop - z0)
+        skel_top = skel_crop[rel_start:rel_stop, :, :]
+        trach_top = (skel_top > 0) & (edt_top >= thr_primary)
+        if not trach_top.any():
+            thr_fallback = max(self.RAD_Q50, 0.6 * self.RAD_Q95)
+            trach_top = (skel_top > 0) & (edt_top >= thr_fallback)
+        trach_top = ndimage.binary_dilation(trach_top, iterations=2)
+        out["trachea_mask"][top_slice, y0:y1 + 1, x0:x1 + 1] = trach_top
+
+        return out
+
     def compute_image_complexity(self, image_patch: np.ndarray, label_patch: np.ndarray) -> Dict[str, float]:
+        # Image complexity metrics: contrast, SNR, boundary gradient, composite complexity score as described within the report
         fg = (label_patch > 0)
         if not fg.any():
             return {"complexity_score": 0.0}
@@ -296,20 +411,26 @@ class PatchAuditSystem:
         }
 
     def _compute_sampling_weight(self, fg_fraction: float, radius_class_weight: float, topology_score: float, complexity_score: float) -> float:
-        base_weight = 0.1 if fg_fraction < 1e-3 else 1.0
+        # Composite sampling weight based on descriptors, bounded to [0.05, 5.0], with heuristic formula
+        dz, dy, dx = self.patch_size
+        # Avoid overweighting very small fg fractions
+        fg_eps = 100.0 / float(dz * dy * dx)
+        # Base weight: downweight very small fg fractions
+        base_weight = 0.1 if fg_fraction < fg_eps else 1.0
         radius_weight = float(radius_class_weight)
+        # Emphasize topology and complexity scores (0.0-2.0 and 0.0-3.0 respectively)
         topology_weight = 1.0 + 0.5 * float(topology_score)
-        complexity_weight = 1.0 + 0.3 * float(complexity_score)
+        complexity_weight = 1.0 + 0.5 * float(complexity_score)
         w = base_weight * radius_weight * topology_weight * complexity_weight
         return float(max(0.05, min(w, 5.0)))
-
+    
     def _radius_class_weight(self, mean_radius_mm: float) -> Tuple[str, float]:
-        # Coarse bins (adjust later after global quantiles are known)
-        if mean_radius_mm > 8.0:
+        RAD_Q50, RAD_Q95, RAD_Q99 = 0.725, 2.791, 4.808  # mm
+        if mean_radius_mm > RAD_Q99:
             return ("main", 0.6)
-        if mean_radius_mm > 4.0:
+        if mean_radius_mm > RAD_Q95:
             return ("segmental", 0.8)
-        if mean_radius_mm > 2.0:
+        if mean_radius_mm > RAD_Q50:
             return ("subsegmental", 1.0)
         return ("distal", 1.4)
 
@@ -325,6 +446,10 @@ class PatchAuditSystem:
         label = np.load(str(label_path), mmap_mode="r")
         lung = np.load(str(lung_path), mmap_mode="r") if (lung_path and lung_path.exists()) else None
         assert image.shape == label.shape, f"Shape mismatch for {case_id}: {image.shape} vs {label.shape}"
+        # Precompute landmark masks once per case
+        lm = self.compute_landmark_masks(label, lung, spacing_zyx_mm)
+        lm_bif = lm.get("bifurcation_mask")
+        lm_trach = lm.get("trachea_mask")
         positions = _generate_patch_positions(image.shape, self.patch_size, self.stride)
         out: List[Dict] = []
         for (z, y, x) in tqdm(positions, desc=f"{case_id}: patches", leave=False):
@@ -344,6 +469,10 @@ class PatchAuditSystem:
             imgc = self.compute_image_complexity(img_p, lbl_p)
             # radius class
             rclass, rweight = self._radius_class_weight(skel.get("radius_mean_mm", 0.0))
+            # Landmark flags for this patch
+            dz, dy, dx = self.patch_size
+            has_bif = bool(lm_bif[z:z+dz, y:y+dy, x:x+dx].any()) if isinstance(lm_bif, np.ndarray) else False
+            has_trach = bool(lm_trach[z:z+dz, y:y+dy, x:x+dx].any()) if isinstance(lm_trach, np.ndarray) else False
             weight = self._compute_sampling_weight(
                 fg_fraction=fg_frac_unw,
                 radius_class_weight=rweight,
@@ -370,6 +499,8 @@ class PatchAuditSystem:
                 "radius_class": rclass,
                 "sampling_weight": weight,
                 "used_skan": bool(skel.get("used_skan", False)),
+                "is_bifurcation": bool(has_bif),
+                "is_trachea": bool(has_trach),
             })
         if self.max_patches_per_case is not None and len(out) > self.max_patches_per_case:
             rng = np.random.default_rng(123)
@@ -438,6 +569,53 @@ def _aggregate_global_stats(all_patch_descs: List[Dict]) -> Dict[str, Dict[str, 
     return stats
 
 
+def audit_worker(
+    stem: str,
+    img_path_str: str,
+    lbl_path_str: str,
+    lung_path_str: Optional[str],
+    meta_json_str: Optional[str],
+    patch_size: Tuple[int, int, int],
+    stride: Tuple[int, int, int],
+    min_lung_coverage: float,
+    max_patches_per_case: Optional[int],
+    use_skan: bool,
+    out_dir_str: str,
+) -> Tuple[str, int]:
+    """Top-level worker for parallel execution"""
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+    os.environ.setdefault("ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS", "1")
+    img_p = Path(img_path_str)
+    lbl_p = Path(lbl_path_str)
+    lung_p = Path(lung_path_str) if lung_path_str else None
+    meta_json = Path(meta_json_str) if meta_json_str else None
+    out_dir = Path(out_dir_str)
+    spacing_zyx = _read_spacing_zyx_from_meta(meta_json) if meta_json and meta_json.exists() else None
+    auditor_local = PatchAuditSystem(
+        patch_size=tuple(int(x) for x in patch_size),
+        stride=tuple(int(x) for x in stride),
+        min_lung_coverage=float(min_lung_coverage),
+        max_patches_per_case=max_patches_per_case,
+        use_skan=bool(use_skan),
+    )
+    patch_descs = auditor_local.audit_case(
+        case_id=stem,
+        image_path=img_p,
+        label_path=lbl_p,
+        lung_path=lung_p,
+        spacing_zyx_mm=spacing_zyx,
+    )
+    bank_mgr = PatchBankManager()
+    setattr(bank_mgr, "_patch_size", tuple(int(x) for x in patch_size))
+    setattr(bank_mgr, "_stride", tuple(int(x) for x in stride))
+    bank_mgr.save_patch_bank(patch_descs, out_dir / f"{stem}.pkl.gz")
+    return (stem, len(patch_descs))
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Offline patch audit generator (Phase 1)")
@@ -449,6 +627,8 @@ def main():
     parser.add_argument("--max_patches_per_case", type=int, default=None, help="Optional cap per case for memory/time control")
     parser.add_argument("--limit_cases", type=int, default=None, help="Optionally limit number of cases for a dry run")
     parser.add_argument("--use_skan", action="store_true", help="Use skan to compute skeleton geodesic length (slower, more accurate)")
+    parser.add_argument("--num_workers", type=int, default=0, help="Parallelize across cases with this many workers (0 = no parallelism)")
+    parser.add_argument("--skip_global_stats", action="store_true", help="Skip writing global_stats.json to save time")
     args = parser.parse_args()
 
     data_root = Path(args.data_root)
@@ -461,40 +641,71 @@ def main():
     if not items:
         print(f"No cases found under {data_root}")
         return
+    processed_counts: List[int] = []
+    if int(args.num_workers) and args.num_workers > 0:
+        # 'spawn' to avoid fork-related crashes with NumPy/SciPy/ITK, and limit intra-op threads
+        ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(
+            max_workers=int(args.num_workers),
+            mp_context=ctx,
+        ) as ex:
+            futures = [
+                ex.submit(
+                    audit_worker,
+                    stem,
+                    str(img_p),
+                    str(lbl_p),
+                    str(lung_p) if lung_p else None,
+                    str(meta_json) if meta_json else None,
+                    tuple(int(x) for x in args.patch_size),
+                    tuple(int(x) for x in args.stride),
+                    float(args.min_lung_coverage),
+                    args.max_patches_per_case,
+                    bool(args.use_skan),
+                    str(out_dir),
+                )
+                for (stem, img_p, lbl_p, lung_p, meta_json) in items
+            ]
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="Cases (parallel)"):
+                try:
+                    _, n = fut.result()
+                    processed_counts.append(int(n))
+                except Exception as e:
+                    print(f"[patch_audit] ERROR processing case: {e}")
+    else:
+        # Fallback: sequential processing
+        for (stem, img_p, lbl_p, lung_p, meta_json) in tqdm(items, desc="Cases"):
+            _, n = audit_worker(
+                stem,
+                str(img_p),
+                str(lbl_p),
+                str(lung_p) if lung_p else None,
+                str(meta_json) if meta_json else None,
+                tuple(int(x) for x in args.patch_size),
+                tuple(int(x) for x in args.stride),
+                float(args.min_lung_coverage),
+                args.max_patches_per_case,
+                bool(args.use_skan),
+                str(out_dir),
+            )
+            processed_counts.append(int(n))
 
-    auditor = PatchAuditSystem(
-        patch_size=tuple(int(x) for x in args.patch_size),
-        stride=tuple(int(x) for x in args.stride),
-        min_lung_coverage=float(args.min_lung_coverage),
-        max_patches_per_case=args.max_patches_per_case,
-        use_skan=bool(args.use_skan),
-    )
+    if not bool(args.skip_global_stats):
+        all_descs: List[Dict] = []
+        for bank_file in tqdm(sorted(out_dir.glob("*.pkl.gz")), desc="Aggregating stats from banks"):
+            try:
+                with gzip.open(str(bank_file), "rb") as f:
+                    obj = pickle.load(f)
+                patch_list = obj.get("patch_descriptors", obj) if isinstance(obj, dict) else (obj if isinstance(obj, list) else [])
+                all_descs.extend(patch_list)
+            except Exception as e:
+                print(f"WARN: failed to read {bank_file.name} for stats: {e}")
+        stats = _aggregate_global_stats(all_descs)
+        with open(out_dir / "global_stats.json", "w") as f:
+            json.dump(stats, f, indent=2)
+        print(f"Saved global stats to {out_dir / 'global_stats.json'}")
 
-    bank_mgr = PatchBankManager()
-    # attach context so PatchBankManager can embed in metadata
-    setattr(bank_mgr, "_patch_size", tuple(int(x) for x in args.patch_size))
-    setattr(bank_mgr, "_stride", tuple(int(x) for x in args.stride))
-    global_descs: List[Dict] = []
-
-    for (stem, img_p, lbl_p, lung_p, meta_json) in tqdm(items, desc="Cases"):
-        spacing_zyx = _read_spacing_zyx_from_meta(meta_json) if meta_json and meta_json.exists() else None
-        patch_descs = auditor.audit_case(
-            case_id=stem,
-            image_path=img_p,
-            label_path=lbl_p,
-            lung_path=lung_p,
-            spacing_zyx_mm=spacing_zyx,
-        )
-        bank_path = out_dir / f"{stem}.pkl.gz"
-        bank_mgr.save_patch_bank(patch_descs, bank_path)
-        global_descs.extend(patch_descs)
-
-    # Save global stats / histograms
-    stats = _aggregate_global_stats(global_descs)
-    with open(out_dir / "global_stats.json", "w") as f:
-        json.dump(stats, f, indent=2)
-    print(f"Saved global stats to {out_dir / 'global_stats.json'}")
-    print(f"Completed patch audit for {len(items)} cases. Patch banks in: {out_dir}")
+    print(f"Completed patch audit for {len(items)} cases. Wrote {len(list(out_dir.glob('*.pkl.gz')))} banks to: {out_dir}")
 
 
 if __name__ == "__main__":

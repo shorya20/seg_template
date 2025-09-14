@@ -10,23 +10,39 @@ from concurrent.futures import ProcessPoolExecutor
 from typing import Tuple, List, Optional
 from joblib import Parallel, delayed
 import nibabel as nib
+
 from skimage.measure import regionprops, label as skimage_label
-from scipy.ndimage import binary_fill_holes
+from skimage.segmentation import clear_border
+from skimage.morphology import disk
+from skimage.filters import threshold_otsu
+
+from scipy.ndimage import (
+    binary_fill_holes, binary_opening, binary_closing, binary_erosion,
+    label, generate_binary_structure, binary_dilation, distance_transform_edt
+)
+
 import traceback
-from functools import partial
+import numpy as np
+from tqdm import tqdm
 import multiprocessing
+from functools import partial
 import torch
 
+os.environ.setdefault("ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
-# Ensure we have SimpleITK and lungmask installed
 try:
     import SimpleITK as sitk
     from lungmask import mask as lungmask_model
 except ImportError:
     print("SimpleITK or lungmask is not installed. Please install it using 'pip install SimpleITK-SimpleElastix lungmask'.")
     sys.exit(1)
-import numpy as np
-from tqdm import tqdm
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -34,11 +50,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 def _save_meta(base_path: str, meta: dict) -> None:
-    """Write JSON next to output .npy. Converts tuples ➜ lists for JSON."""
     for k, v in meta.items():
         if isinstance(v, tuple):
             meta[k] = list(v)
@@ -46,443 +58,594 @@ def _save_meta(base_path: str, meta: dict) -> None:
         json.dump(meta, fp, indent=2)
 
 
-def _sigma_for_spacing(original: Tuple[float, float, float], target: Tuple[float, float, float]) -> List[float]:
-    """Gaussian sigma (physical units) for anti‑aliasing when *down‑sampling*."""
-    sigmas = [0.5 * (t / o) if t > o else 0.0 for t, o in zip(target, original)]
-    return [s * o for s, o in zip(sigmas, original)]  # convert to physical units
+def _clear_border_xy_per_slice(seg3d: np.ndarray) -> np.ndarray:
+    out = np.zeros_like(seg3d, dtype=bool)
+    for z in range(seg3d.shape[0]):
+        out[z] = clear_border(seg3d[z].astype(bool))
+    return out
 
-def safe_convert_nifti_file(file, output_dir, is_label=False, target_spacing_xyz=None, antialias=True):
+def _air_body_candidates(image_for_masking: sitk.Image) -> tuple[np.ndarray, np.ndarray]:
     """
-    Safely convert and resample a NIfTI file to NumPy format, ensuring
-    critical metadata ('original_affine', 'original_spatial_shape') is always saved.
+    Robust, model-free lung candidate from intensities on the SAME grid used for lungmask.
+    Steps:
+    1) Build a coarse thoracic body mask (percentile-based) and fill holes.
+    2) Map intensities to a pseudo-HU using robust percentiles (5–95) *inside body*.
+    3) Inside the coarse body, compute an Otsu threshold to separate air-like from soft tissue.
+    4) Cleanup per-slice clear_border; keep the 2 largest 3D components; fill holes.
+    5) Fallback: looser percentile rule if result is implausibly small.
+    Returns:
+        cand: uint8 {0,1} candidate lung (air ∧ body)
+        body: uint8 {0,1} coarse body mask
+    """
+    np_img = sitk.GetArrayFromImage(image_for_masking).astype(np.float32)
+    p10, p50 = np.percentile(np_img, [10, 50])
+    body_thr = p10 + 0.05 * (p50 - p10)
+    body0 = np_img > body_thr
+
+    lab, n = skimage_label(body0.astype(np.uint8), return_num=True)
+    if n > 1:
+        sizes = np.bincount(lab.ravel())
+        keep = np.argmax(sizes[1:]) + 1 if sizes.size > 1 else 0
+        body0 = (lab == keep)
+
+    body0 = binary_opening(body0, structure=np.ones((3, 3, 3)), iterations=1)
+    body0 = binary_closing(body0, structure=np.ones((3, 3, 3)), iterations=1)
+    body0 = binary_fill_holes(body0)
+
+    if not np.any(body0):
+        thr35 = np.percentile(np_img, 35)  
+        body0 = np_img > thr35
+        if body0.any():
+            lab, n = skimage_label(body0.astype(np.uint8), return_num=True)
+            if n > 1:
+                sizes = np.bincount(lab.ravel()); body0 = (lab == (np.argmax(sizes[1:]) + 1))
+            body0 = binary_fill_holes(body0)
+        else:
+            empty = np.zeros_like(np_img, dtype=np.uint8)
+            return empty, empty  # (cand, body) both empty; caller will handle
+
+    vals = np_img[body0 > 0]
+    p05, p95 = np.percentile(vals, [5, 95]) if vals.size > 1000 else (np.min(vals), np.max(vals))
+    if p95 - p05 < 1e-3:
+        scale, offset = 1.0, 0.0
+    else:
+        scale = 2000.0 / float(p95 - p05)
+        offset = -1000.0 - scale * float(p05)
+    pseudo_hu = np_img * scale + offset
+
+    try:
+        t = float(threshold_otsu(pseudo_hu[body0 > 0]))
+    except Exception:
+        t = -400.0
+    t = np.clip(t, -800.0, -200.0) 
+    cand = (pseudo_hu <= t) & body0
+
+    cand = _clear_border_xy_per_slice(cand)
+    lab, n = skimage_label(cand.astype(np.uint8), return_num=True)
+    if n > 2:
+        sizes = np.bincount(lab.ravel())
+        order = np.argsort(sizes[1:])[::-1] + 1
+        cand = np.isin(lab, order[:2])
+    cand = binary_fill_holes(cand).astype(np.uint8)
+    frac = float(cand.sum()) / float(np_img.size)
+    if frac < 0.001:
+        body_vals = np_img[body0 > 0]
+        if body_vals.size > 0:
+            loose_thr = np.percentile(body_vals, 20)
+            cand2 = (np_img <= loose_thr) & body0
+            cand2 = _clear_border_xy_per_slice(cand2)
+            lab, n = skimage_label(cand2.astype(np.uint8), return_num=True)
+            if n > 2:
+                sizes = np.bincount(lab.ravel())
+                order = np.argsort(sizes[1:])[::-1] + 1
+                cand2 = np.isin(lab, order[:2])
+            cand2 = binary_fill_holes(cand2).astype(np.uint8)
+            if cand2.sum() > cand.sum():
+                cand = cand2
+
+    return cand.astype(np.uint8), body0.astype(np.uint8)
+
+
+def _load_and_preprocess_sitk(nifti_path: str, is_label: bool = False) -> sitk.Image | None:
+    """
+    Load a NIfTI with nibabel, build a SimpleITK image on the original grid (LPS),
+    and fix intensities so air is HU-like. Labels are passed through (nearest-neighbor later).
     """
     try:
-        # Load with nibabel FIRST to get the TRUE original affine and shape for final saving.
-        # This is the most important step to fix the inconsistency.
+        import numpy as _np
+        import nibabel as _nib
+        from scipy.ndimage import binary_closing as _bin_close, binary_fill_holes as _bin_fill
+
+        # --- 1) Load with nibabel and pull float array with header scaling (if any) ---
+        nii = _nib.load(nifti_path)
+        data = nii.get_fdata(dtype=_np.float32, caching='unchanged') 
+        on_disk_kind = _np.dtype(nii.get_data_dtype()).kind  # 'i','u','f'
+
+        # --- 2) Build LPS meta from the affine (nibabel uses RAS) ---
+        aff = nii.affine
+        spacing_xyz = _np.sqrt(_np.sum(aff[:3, :3] ** 2, axis=0))  # col norms
+        R_ras = aff[:3, :3] / _np.maximum(spacing_xyz, 1e-8)
+        t_ras = aff[:3, 3]
+        ras2lps = _np.diag([-1.0, -1.0, 1.0])
+        R_lps = ras2lps @ R_ras
+        t_lps = (ras2lps @ t_ras.reshape(3, 1)).ravel()
+        arr_zyx = _np.transpose(data, (2, 1, 0)).astype(_np.float32, copy=False)
+
+        if is_label:
+            img = sitk.GetImageFromArray(arr_zyx.astype(_np.uint8, copy=False))
+            img.SetSpacing(tuple(map(float, spacing_xyz.tolist())))
+            img.SetDirection(R_lps.flatten().tolist())
+            img.SetOrigin(t_lps.tolist())
+            return img
+
+        integer_like = (on_disk_kind in ('i', 'u')) and (_np.nanmin(arr_zyx) >= 0.0)
+        if integer_like:
+            x = arr_zyx - 1024.0  # put air near −1000 HU (water ~0) for lungmask robustness
+        else:
+            x = arr_zyx
+            p10, p50 = _np.nanpercentile(x, [10, 50])
+            thr = p10 + 0.05 * (p50 - p10)
+            body = x > thr
+            # keep largest 3D component
+            try:
+                from scipy.ndimage import label as _ndlabel
+                lab, n = _ndlabel(body.astype(_np.uint8))
+                if n > 1:
+                    sizes = _np.bincount(lab.ravel())
+                    keep = _np.argmax(sizes[1:]) + 1
+                    body = (lab == keep)
+            except Exception:
+                pass
+            body = _bin_fill(_bin_close(body, structure=_np.ones((3, 3, 3), _np.uint8)))
+            vals = x[body]
+            if vals.size > 1000:
+                hist, edges = _np.histogram(vals, bins=512)
+                centers = 0.5 * (edges[:-1] + edges[1:])
+                air_peak = float(centers[_np.argmax(hist)])
+                if not (-1100.0 <= air_peak <= -800.0):
+                    x = x + (-1000.0 - air_peak)  
+        x = _np.nan_to_num(x, copy=False).astype(_np.float32, copy=False)
+        img = sitk.GetImageFromArray(x)
+        img.SetSpacing(tuple(map(float, spacing_xyz.tolist())))
+        img.SetDirection(R_lps.flatten().tolist())
+        img.SetOrigin(t_lps.tolist())
+        return img
+
+    except Exception as e:
+        logger.error(f"Error during nibabel/SITK loading/preprocessing for {nifti_path}: {e}")
+        return None
+
+
+
+def safe_convert_nifti_file(file, output_dir, is_label=False, target_spacing_xyz=None, antialias=True, force: bool=False):
+    """
+    Safely convert and resample a NIfTI file to NumPy format, writing a JSON metadata sidecar.
+    Respects `force` to overwrite existing .npy.
+    """
+    try:
+        # Always read metadata from nibabel for consistency
         nii_orig = nib.load(file)
         original_affine = nii_orig.affine
-        original_affine_nii = original_affine.tolist() # Convert to list for JSON
         original_shape_nii = nii_orig.shape
-        
-        # Extract PROPER direction and origin from the original affine matrix
-        # The direction matrix should be normalized (unit vectors)
         original_spacing_from_affine = np.sqrt(np.sum(original_affine[:3, :3]**2, axis=0))
-        original_direction = original_affine[:3, :3] / original_spacing_from_affine
-        original_direction = original_direction.tolist()
+        original_direction = (original_affine[:3, :3] / np.maximum(original_spacing_from_affine, 1e-6)).tolist()
         original_origin = original_affine[:3, 3].tolist()
-    except Exception as e:
-        logger.error(f"FATAL: Nibabel could not load {file} to get essential metadata: {e}")
-        # If we can't get this, we cannot proceed.
-        return False, f"Failed to load NIfTI header for {file}"
 
-    try:
-        file_path = file 
-        fn = os.path.basename(file_path)
+        fn = os.path.basename(file)
         stem = os.path.splitext(os.path.splitext(fn)[0])[0]
         out_npy = os.path.join(output_dir, f"{stem}.npy")
-        if os.path.exists(out_npy):
+        if os.path.exists(out_npy) and not force:
             logger.debug("%s already exists – skipping", out_npy)
             return True, None
 
-        # --- REFACTORED: Use centralized loading and preprocessing function ---
-        itk_image_to_process = _load_and_preprocess_sitk(file_path, is_label=is_label)
-        if itk_image_to_process is None:
-            return False, f"Failed to load or preprocess {file_path}"
-        # --- END REFACTORED SECTION ---
-
-        # This section no longer queries the itk_image for metadata.
-        # Instead, it exclusively uses the definitive metadata from the nibabel header.
-        original_spacing_nii = original_spacing_from_affine.tolist()
-
+        img_sitk = _load_and_preprocess_sitk(file, is_label=is_label)
+        if img_sitk is None:
+            return False, f"Failed to load or preprocess {file}"
+        try:
+            oriented = sitk.DICOMOrient(img_sitk, "LPS")
+        except Exception:
+            oriented = img_sitk
+            
         if target_spacing_xyz and len(target_spacing_xyz) == 3:
             target_spacing = tuple(float(s) for s in target_spacing_xyz)
-            resample = sitk.ResampleImageFilter()
-            if is_label:
-                resample.SetInterpolator(sitk.sitkNearestNeighbor)
-            else:
-                resample.SetInterpolator(sitk.sitkLinear)
-            default_pixel_value = 0.0 if is_label else -1024.0
-            resample.SetDefaultPixelValue(default_pixel_value)
-            new_size = [int(round(orig_sz * orig_sp / target_sp))
-                        for orig_sz, orig_sp, target_sp in zip(original_shape_nii, original_spacing_nii, target_spacing)]
-            resample.SetOutputSpacing(target_spacing)
-            resample.SetSize(new_size)
-            # Explicitly set the output orientation and origin from the original NIfTI file
-            # to prevent SimpleITK from reorienting the image.
-            resample.SetOutputDirection(np.array(original_direction).flatten().tolist())
-            resample.SetOutputOrigin(original_origin)
-            resample.SetTransform(sitk.Transform())
-            resampled_itk_image = resample.Execute(itk_image_to_process)
+            o_size = oriented.GetSize()
+            o_spacing = oriented.GetSpacing()
+            new_size = [int(round(osz * osp / tsp)) for osz, osp, tsp in zip(o_size, o_spacing, target_spacing)]
+            R = sitk.ResampleImageFilter()
+            R.SetInterpolator(sitk.sitkNearestNeighbor if is_label else sitk.sitkLinear)
+            R.SetDefaultPixelValue(0.0 if is_label else -1024.0)
+            R.SetOutputSpacing(target_spacing)
+            R.SetSize(new_size)
+            R.SetOutputDirection(oriented.GetDirection())
+            R.SetOutputOrigin(oriented.GetOrigin())
+            R.SetTransform(sitk.Transform())
+            img_proc = R.Execute(oriented)
         else:
-            resampled_itk_image = itk_image_to_process
+            img_proc = oriented
 
-        final_data_zyx = sitk.GetArrayFromImage(resampled_itk_image)
-        
-        # Add a check to prevent saving empty arrays
-        if final_data_zyx.size == 0:
-            error_message = f"CRITICAL ERROR: Resampled image for {file_path} resulted in an empty array. Skipping save."
-            logger.critical(error_message)
-            return False, error_message
-            
-        final_dtype = np.float32 if not is_label else np.uint8
-        final_data_zyx = final_data_zyx.astype(final_dtype)
+        final = sitk.GetArrayFromImage(img_proc)
+        if final.size == 0:
+            return False, f"Empty array after resampling for {file}"
 
-        np.save(out_npy, final_data_zyx)
-        metadata = {
+        final = final.astype(np.uint8 if is_label else np.float32)
+        np.save(out_npy, final)
+
+        meta = {
             'original_filename': fn,
-            'original_affine': original_affine_nii,
-            'original_spatial_shape': original_shape_nii,
-            'original_spacing': original_spacing_nii,
+            'original_affine': original_affine.tolist(),
+            'original_spatial_shape': list(original_shape_nii),
+            'original_spacing': original_spacing_from_affine.tolist(),
             'original_size': list(original_shape_nii),
             'original_direction': original_direction,
             'original_origin': original_origin,
-            'processed_spacing': resampled_itk_image.GetSpacing(),
-            'processed_size': resampled_itk_image.GetSize(),
-            'processed_direction': resampled_itk_image.GetDirection(),
-            'processed_origin': resampled_itk_image.GetOrigin(),
-            'numpy_array_shape_zyx': final_data_zyx.shape,
+            'processed_spacing': list(img_proc.GetSpacing()),
+            'processed_size': list(img_proc.GetSize()),
+            'processed_direction': list(img_proc.GetDirection()),
+            'processed_origin': list(img_proc.GetOrigin()),
+            'numpy_array_shape_zyx': list(final.shape),
             'is_label': is_label,
-            'target_spacing_if_resampled': target_spacing_xyz if target_spacing_xyz else "N/A"
+            'target_spacing_if_resampled': target_spacing_xyz if target_spacing_xyz else "N/A",
         }
-        
-        base_name = os.path.splitext(os.path.basename(out_npy))[0]
-        _save_meta(os.path.join(output_dir, base_name), metadata)
-
+        base = os.path.splitext(os.path.basename(out_npy))[0]
+        _save_meta(os.path.join(output_dir, base), meta)
         return True, None
 
     except Exception as e:
-        error_message = f"CRITICAL ERROR during SimpleITK processing for {file_path}: {str(e)}\n{traceback.format_exc()}"
-        logger.critical(error_message)
-        return False, error_message
+        return False, f"Error during SimpleITK processing for {file}: {str(e)}\n{traceback.format_exc()}"
 
-def convert_nifti_to_numpy(nifti_path, output_dir, file_pattern="*.nii.gz", is_label=False, target_spacing_xyz=None, num_workers=6):
-    """
-    Convert NIfTI files to NumPy arrays with validation and multiprocessing.
-    
-    Args:
-        nifti_path (str): Path to directory containing NIfTI files.
-        output_dir (str): Output directory for NumPy arrays.
-        file_pattern (str): Pattern to match NIfTI files. Default is "*.nii.gz".
-        is_label (bool): Whether the files are label masks.
-        target_spacing (tuple): Target spacing for resampling.
-    """
+
+def convert_nifti_to_numpy(nifti_path, output_dir, file_pattern="*.nii.gz",
+                        is_label=False, target_spacing_xyz=None, num_workers=6, force: bool=False):
+    """Parallel NIfTI→NumPy conversion with metadata writing."""
     os.makedirs(output_dir, exist_ok=True)
-    files = sorted(glob(os.path.join(nifti_path, file_pattern))) # Ensure files is a list of strings
+    files = sorted(glob(os.path.join(nifti_path, file_pattern)))
     if not files:
         logger.warning(f"No NIfTI files found in {nifti_path} with pattern {file_pattern}.")
         return
-    
-    logger.info(f"Found {len(files)} NIfTI files to convert in {nifti_path}.")
-    logger.info(f"Converting {len(files)} NIfTI files to NumPy arrays: is_label={is_label}, target_spacing={target_spacing_xyz}, workers={num_workers}")
-
-    # Use ProcessPoolExecutor for parallel conversion
+    logger.info(f"Converting {len(files)} files: is_label={is_label}, target_spacing={target_spacing_xyz}, workers={num_workers}, force={force}")
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        # Ensure target_spacing_tuple is correctly passed
-        future_to_file = {
-            executor.submit(safe_convert_nifti_file, file, output_dir, is_label, target_spacing_xyz): file
-            for file in files
+        futs = {
+            executor.submit(safe_convert_nifti_file, f, output_dir, is_label, target_spacing_xyz, True, force): f
+            for f in files
         }
-        for future in tqdm(future_to_file, desc=f"Converting {os.path.basename(nifti_path)}"):
-            file = future_to_file[future]
+        for fut in tqdm(futs, desc=f"Converting {os.path.basename(nifti_path)}"):
+            file = futs[fut]
             try:
-                success, error_msg = future.result()
-                if not success:
-                    logger.error(f"Failed to convert {file}: {error_msg}")
+                ok, msg = fut.result()
+                if not ok:
+                    logger.error(f"Failed to convert {file}: {msg}")
             except Exception as e:
                 logger.error(f"Conversion process for {file} raised an unexpected error: {str(e)}")
-    
+
 
 def process_single_file(label_file, output_dir, sigma, decay_factor):
-    """Process a single label file to generate weight map."""
     try:
         filename = os.path.basename(label_file)
         label_data = np.load(label_file)
-        
-        # Check if label has any foreground voxels before calculating
+
         if np.sum(label_data > 0) == 0:
             logger.warning(f"Label file {filename} has no foreground voxels, generating default weight map.")
             weight_map = np.ones_like(label_data, dtype=np.float32)
         else:
-            # Convert label data to binary mask (ensure it's binary)
             binary_mask = (label_data > 0).astype(np.uint8)
-            
-            # Calculate Euclidean distance transform - distance from background to foreground
-            from scipy.ndimage import distance_transform_edt   
             distance_map = distance_transform_edt(binary_mask == 0)
-            
-            # Calculate weight map
             weight_map = 1 + decay_factor * np.exp(-distance_map**2 / (2 * sigma**2))
-        
-        # Save the weight map
-        weight_map_filename = os.path.join(output_dir, filename)
-        np.save(weight_map_filename, weight_map.astype(np.float32))
+
+        out = os.path.join(output_dir, filename)
+        np.save(out, weight_map.astype(np.float32))
         return filename
     except Exception as e:
         logger.error(f"Error processing weight map for {label_file}: {str(e)}")
         return None
 
-def generate_weight_maps(label_dir, output_dir, sigma=20, decay_factor=5, num_processes=4, num_workers=-1):
-    """
-    Generates weight maps from label files using multiprocessing.
-    Args:
-        label_dir (str): Directory containing label files (binary masks).
-        output_dir (str): Directory to save the generated weight maps.
-        sigma (float): Sigma for the Gaussian filter.
-        decay_factor (float): Decay factor for the distance transform.
-        num_processes (int): Number of processes to use for parallelization.
-                             This will be overridden by num_workers if num_workers is not -1.
-        num_workers (int): Number of workers to use for parallelization.
-                           If -1, uses num_processes. If num_processes is also not set, it defaults to os.cpu_count().
-    """
+
+def generate_weight_maps(label_dir, output_dir, sigma=20, decay_factor=5, num_processes=4, num_workers=1):
     os.makedirs(output_dir, exist_ok=True)
     label_files = sorted([f for f in glob(os.path.join(label_dir, "*.npy")) if "_metadata" not in os.path.basename(f)])
-
     if not label_files:
         logger.warning(f"No label files found in {label_dir}")
         return
 
-    # Determine the number of workers to use
-    if num_workers != -1:
-        actual_num_workers = num_workers
-    elif num_processes is not None: # num_processes might be the explicitly passed value or default
-        actual_num_workers = num_processes
-    else:
-        actual_num_workers = os.cpu_count() or 1 # Fallback to 1 if os.cpu_count() is None
-
+    actual_num_workers = num_workers if num_workers != -1 else (num_processes or (os.cpu_count() or 1))
     logger.info(f"Generating weight maps for {len(label_files)} label files using {actual_num_workers} workers/processes.")
 
-    # Using joblib's Parallel for consistency, though multiprocessing.Pool was also fine.
-    # We will stick to the existing structure of process_single_file and adapt it slightly if needed.
-    # The `process_single_file` function needs to be standalone or picklable.
-
-    # Create a partial function with fixed arguments for sigma and decay_factor
-    # process_func = partial(process_single_file, output_dir=output_dir, sigma=sigma, decay_factor=decay_factor)
-
     results = []
-    # Sequential processing for easier debugging if actual_num_workers is 1 or for small N
-    if actual_num_workers == 1 or len(label_files) < actual_num_workers : # Simple heuristic
-        logger.info("Processing weight maps sequentially.")
-        for label_file in tqdm(label_files):
-            results.append(process_single_file(label_file, output_dir, sigma, decay_factor))
+    if actual_num_workers == 1 or len(label_files) < actual_num_workers:
+        for lf in tqdm(label_files):
+            results.append(process_single_file(lf, output_dir, sigma, decay_factor))
     else:
-        logger.info(f"Processing weight maps in parallel with {actual_num_workers} workers.")
-        # Parallel processing using joblib
-        # Ensure process_single_file is compatible (it should be as it takes simple args)
         results = Parallel(n_jobs=actual_num_workers)(
-            delayed(process_single_file)(label_file, output_dir, sigma, decay_factor)
-            for label_file in tqdm(label_files)
+            delayed(process_single_file)(lf, output_dir, sigma, decay_factor) for lf in tqdm(label_files)
         )
-    
-    successful = [r for r in results if r is not None]
-    logger.info(f"Weight maps generated and saved to {output_dir} ({len(successful)}/{len(label_files)} successful)")
+    ok = [r for r in results if r is not None]
+    logger.info(f"Weight maps saved to {output_dir} ({len(ok)}/{len(label_files)} successful).")
 
-def process_single_lung_mask(nifti_path, output_dir, target_spacing_xyz=None):
-    """
-    Generates a robust lung mask from an original NIfTI CT image file using the lungmask library.
-    Now uses the same processing pipeline as images/labels to ensure proper coordinate alignment,
-    and includes robust percentile normalization for outlier cases.
-    """
+
+def process_single_lung_mask(nifti_path, output_dir, target_spacing_xyz=None, force: bool = False,
+                             gpu_semaphore: Optional[multiprocessing.synchronize.Semaphore] = None,
+                             force_cpu: Optional[bool] = None,
+                             lm_batch_env: Optional[int] = None):
+
     try:
         filename_base = os.path.basename(nifti_path).split('.')[0]
-        output_path = os.path.join(output_dir, f"{filename_base}.npy")
+        out_path = os.path.join(output_dir, f"{filename_base}.npy")
+        if os.path.exists(out_path) and not force:
+            logger.debug(f"Lung mask {out_path} exists; skip (use force=True to overwrite).")
+            return True, None
 
-        if os.path.exists(output_path):
-            logger.debug(f"Lung mask {output_path} already exists, skipping generation.")
-            return True
+        nii_orig = nib.load(nifti_path)
+        orig_affine = nii_orig.affine.copy()
+        orig_shape = nii_orig.shape
+        orig_spacing = np.sqrt(np.sum(orig_affine[:3, :3] ** 2, axis=0))
+        orig_dir = (orig_affine[:3, :3] / np.maximum(orig_spacing, 1e-6)).tolist()
+        orig_org = orig_affine[:3, 3].tolist()
 
-        # STEP 1: Load with nibabel to get original coordinate system info
-        try:
-            nii_orig = nib.load(nifti_path)
-            original_affine = nii_orig.affine.copy()
-            original_affine_nii = original_affine.tolist()
-            original_shape_nii = nii_orig.shape
-            original_spacing_from_affine = np.sqrt(np.sum(original_affine[:3, :3]**2, axis=0))
-            original_direction = original_affine[:3, :3] / original_spacing_from_affine
-            original_origin = original_affine[:3, 3]
-        except Exception as e:
-            logger.error(f"FATAL: Nibabel could not load {nifti_path} to get essential metadata: {e}")
-            return False, f"Failed to load NIfTI header for {nifti_path}"
-
-        # --- REFACTORED: Use centralized loading and preprocessing ---
-        image_to_process = _load_and_preprocess_sitk(nifti_path, is_label=False)
-        if image_to_process is None:
-            return False, f"Failed to load or preprocess {nifti_path} for lungmask"
-        # --- END REFACTORED SECTION ---
-
-        # STEP 4: Apply resampling (same as safe_convert_nifti_file)
+        img_sitk = _load_and_preprocess_sitk(nifti_path, is_label=False)
+        if img_sitk is None:
+            return False, f"Failed to load {nifti_path}"
+        img_lps = sitk.DICOMOrient(img_sitk, "LPS")  
         if target_spacing_xyz and len(target_spacing_xyz) == 3:
             target_spacing = tuple(float(s) for s in target_spacing_xyz)
-            resample = sitk.ResampleImageFilter()
-            resample.SetInterpolator(sitk.sitkLinear)
-            resample.SetDefaultPixelValue(-1024.0)
-            # Use nibabel-derived metadata for resampling calculation
-            orig_size = original_shape_nii
-            orig_spacing = original_spacing_from_affine
-            new_size = [int(round(osz * osp / tsp)) for osz, osp, tsp in zip(orig_size, orig_spacing, target_spacing)]
-            resample.SetOutputSpacing(target_spacing)
-            resample.SetSize(new_size)
-            # Explicitly set the output orientation and origin from the original NIfTI file.
-            resample.SetOutputDirection(np.array(original_direction).flatten().tolist())
-            resample.SetOutputOrigin(original_origin.tolist())
-            resample.SetTransform(sitk.Transform())
-            resampled_image = resample.Execute(image_to_process)
+            o_sz, o_sp = img_lps.GetSize(), img_lps.GetSpacing()
+            new_size = [int(round(sz * sp / tsp)) for sz, sp, tsp in zip(o_sz, o_sp, target_spacing)]
+            R = sitk.ResampleImageFilter()
+            R.SetInterpolator(sitk.sitkLinear)
+            R.SetDefaultPixelValue(-1024.0)
+            R.SetOutputSpacing(target_spacing)
+            R.SetSize(new_size)
+            R.SetOutputDirection(img_lps.GetDirection())
+            R.SetOutputOrigin(img_lps.GetOrigin())
+            R.SetTransform(sitk.Transform())
+            img_proc = R.Execute(img_lps)
         else:
-            resampled_image = image_to_process
+            img_proc = img_lps
 
-        # --- STEP 5: Robust Normalization for Outlier Cases ---
-        stats = sitk.StatisticsImageFilter()
-        stats.Execute(resampled_image)
-        img_min, img_max = stats.GetMinimum(), stats.GetMaximum()
-        
-        image_for_masking = resampled_image
-        # Heuristic to detect outliers: min value is not typical for air, or max is very high
-        if img_min > -500 or img_max > 3000:
-            fn = os.path.basename(nifti_path)
-            logger.warning(f"File {fn} has an unusual intensity range ({img_min:.2f}, {img_max:.2f}) after standard processing. Applying robust percentile normalization for lungmask.")
-            
-            np_image = sitk.GetArrayFromImage(resampled_image)
-            non_bg_voxels = np_image[np_image > np_image.min()]
-            if non_bg_voxels.size > 0:
-                p1 = np.percentile(non_bg_voxels, 1)
-                p99 = np.percentile(non_bg_voxels, 99)
-                
-                np_image = np.clip(np_image, p1, p99)
-                
-                min_val, max_val = np_image.min(), np_image.max()
-                if max_val > min_val:
-                    np_image = (np_image - min_val) / (max_val - min_val)  # Scale to [0, 1]
-                    np_image = (np_image * 1600) - 1000  # Scale to [-1000, 600]
-                
-                normalized_sitk_image = sitk.GetImageFromArray(np_image.astype(np.float32))
-                normalized_sitk_image.CopyInformation(resampled_image)
-                image_for_masking = normalized_sitk_image
-        
-        # --- STEP 6: Run lungmask on the correctly processed image ---
-        segmentation_np = lungmask_model.apply(image_for_masking)
-
-        if np.sum(segmentation_np) == 0:
-            logger.warning(f"Lung mask for {nifti_path} was generated empty by the model. Attempting to create a fallback body mask.")
+        seg = None
+        try:
             try:
-                # Fallback: create a body mask by thresholding at -500 HU
-                body_mask_np = sitk.GetArrayFromImage(image_for_masking) > -500
+                torch.set_num_threads(1)
+            except Exception:
+                pass
+            lm_batch = lm_batch_env if lm_batch_env is not None else int(os.getenv("LUNGMASK_BATCH", "1" if torch.cuda.is_available() else "8"))
+            use_cpu = force_cpu if force_cpu is not None else ((not torch.cuda.is_available()) or os.getenv("LUNGMASK_DEVICE", "auto").lower() in ("cpu", "0", "false"))
+            coarse_mm = float(os.getenv("LUNGMASK_COARSE_SPACING", "1.6"))
+            coarse_mm = max(0.8, coarse_mm) 
+            cur_sp = img_proc.GetSpacing()
+            target_coarse_sp = (
+                max(float(cur_sp[0]), coarse_mm),
+                max(float(cur_sp[1]), coarse_mm),
+                max(float(cur_sp[2]), coarse_mm),
+            )
+            if any(abs(target_coarse_sp[i] - float(cur_sp[i])) > 1e-6 for i in range(3)):
+                o_sz = img_proc.GetSize()
+                new_size = [int(round(sz * sp / tsp)) for sz, sp, tsp in zip(o_sz, cur_sp, target_coarse_sp)]
+                Rpre = sitk.ResampleImageFilter()
+                Rpre.SetInterpolator(sitk.sitkLinear)
+                Rpre.SetDefaultPixelValue(-1024.0)
+                Rpre.SetOutputSpacing(target_coarse_sp)
+                Rpre.SetSize(new_size)
+                Rpre.SetOutputDirection(img_proc.GetDirection())
+                Rpre.SetOutputOrigin(img_proc.GetOrigin())
+                Rpre.SetTransform(sitk.Transform())
+                img_for_lm = Rpre.Execute(img_proc)
+            else:
+                img_for_lm = img_proc
+            
+            if not use_cpu and gpu_semaphore is not None:
+                gpu_semaphore.acquire()
+            try:
+                lm = lungmask_model.apply(
+                    img_for_lm,
+                    batch_size=lm_batch,
+                    volume_postprocessing=True,
+                    force_cpu=use_cpu
+                )
+            finally:
+                if not use_cpu and gpu_semaphore is not None:
+                    gpu_semaphore.release()
 
-                # NEW: Add morphological opening to sever small connections between body and scanner bed
-                from scipy.ndimage import binary_opening
-                # Use a 3x3x3 structuring element. You might need to adjust the size and iterations.
-                body_mask_np = binary_opening(body_mask_np, structure=np.ones((3,3,3)), iterations=2)
+            lm_bin = (lm > 0).astype(np.uint8)
+            if img_for_lm is not img_proc:
+                lm_img = sitk.GetImageFromArray(lm_bin)
+                lm_img.CopyInformation(img_for_lm)
+                Rback = sitk.ResampleImageFilter()
+                Rback.SetInterpolator(sitk.sitkNearestNeighbor)
+                Rback.SetDefaultPixelValue(0)
+                Rback.SetOutputSpacing(img_proc.GetSpacing())
+                Rback.SetSize(img_proc.GetSize())
+                Rback.SetOutputDirection(img_proc.GetDirection())
+                Rback.SetOutputOrigin(img_proc.GetOrigin())
+                Rback.SetTransform(sitk.Transform())
+                lm_img_back = Rback.Execute(lm_img)
+                seg = sitk.GetArrayFromImage(lm_img_back).astype(np.uint8)
+                del lm_img_back, lm_img
+            else:
+                seg = lm_bin
+            del lm_bin
+        except Exception as e:
+            logger.warning(f"lungmask failed on {filename_base}: {e} – falling back to robust candidates")
 
-                # Find the largest connected component, which should be the patient's body
-                labeled_mask, num_features = skimage_label(body_mask_np, return_num=True)
-                if num_features > 0:
-                    component_sizes = np.bincount(labeled_mask.ravel())
-                    if len(component_sizes) > 1:
-                        # Ignore background label 0
-                        largest_component_label = component_sizes[1:].argmax() + 1
-                        # Create a mask of only the largest component
-                        body_mask_np = (labeled_mask == largest_component_label)
-                    else:
-                        body_mask_np = np.zeros_like(body_mask_np, dtype=bool)
+        # Robust candidate on the SAME grid
+        cand, body_mask = _air_body_candidates(img_proc)
+        # Gate or fallback (guard seg is not None)
+        # Robust decision: if lungmask exists but gating empties it (or is implausibly tiny),
+        # fall back to the model‑free candidate computed on the same grid.
+        if seg is not None and seg.sum() > 0:
+            seg_gated = (seg > 0) & (body_mask > 0)
+            # tiny threshold: <0.1% of volume
+            tiny_thresh = 1e-3 * float(seg_gated.size)
+            if seg_gated.sum() <= 0 or float(seg_gated.sum()) < tiny_thresh:
+                # Prefer candidate if non‑empty; otherwise keep the original lungmask result
+                if cand is not None and (cand > 0).sum() > 0:
+                    seg = (cand > 0)
                 else:
-                    body_mask_np = np.zeros_like(body_mask_np, dtype=bool)
+                    seg = seg_gated
+            else:
+                seg = seg_gated
+        else:
+            seg = (cand > 0)
+        seg = _clear_border_xy_per_slice(seg)
+        struct = generate_binary_structure(3, 1)
+        lab, n = skimage_label(seg.astype(np.uint8), return_num=True)
+        if n > 2:
+            bc = np.bincount(lab.ravel())
+            order = np.argsort(bc[1:])[::-1] + 1
+            seg = np.isin(lab, order[:2])
+        seg = binary_closing(seg, structure=struct, iterations=2)
+        seg = binary_fill_holes(seg)
+        seg = binary_dilation(seg, structure=struct, iterations=1) & (body_mask > 0)
+        arr_hu = sitk.GetArrayFromImage(img_proc).astype(np.float32)
+        struct = generate_binary_structure(3, 1)
+        seg = (seg > 0) & (body_mask > 0)
+        seg = _clear_border_xy_per_slice(seg)
+        lab, n = skimage_label(seg.astype(np.uint8), return_num=True)
+        if n > 0:
+            comps = []
+            for lbl in range(1, n + 1):
+                comp = (lab == lbl)
+                if not comp.any():
+                    continue
+                mean_hu = float(arr_hu[comp].mean())
+                size = int(comp.sum())
+                comps.append((size, mean_hu, lbl))
 
-                # Fill holes within the largest component to create a solid body mask
-                final_body_mask = binary_fill_holes(body_mask_np).astype(np.uint8)
+            # Prefer components with mean HU <= -300 (exclude mediastinum/soft tissue)
+            air_like = [(s, l) for (s, m, l) in comps if m <= -300.0]
+            if len(air_like) >= 2:
+                air_like.sort(reverse=True)  # by size
+                keep_labels = [air_like[0][1], air_like[1][1]]
+            elif len(air_like) == 1:
+                keep_labels = [air_like[0][1]]
+                # add the largest remaining as second lung if present
+                remaining = sorted([(s, l) for (s, m, l) in comps if l != keep_labels[0]], reverse=True)
+                if remaining:
+                    keep_labels.append(remaining[0][1])
+            else:
+                # no air-like comps → just keep two largest
+                comps.sort(reverse=True)
+                keep_labels = [t[2] for t in comps[:2]]
 
-                # FINAL SANITY CHECK: If the resulting mask is still huge, it's invalid.
-                # A body mask should not occupy more than ~50% of the total volume.
-                total_voxels = np.prod(final_body_mask.shape)
-                mask_voxels = np.sum(final_body_mask)
-                if (mask_voxels / total_voxels) > 0.5:
-                    logger.error(f"Fallback for {nifti_path} created an invalid, oversized mask ({mask_voxels} voxels). Discarding and saving an empty mask.")
-                    final_body_mask = np.zeros_like(final_body_mask, dtype=np.uint8)
+            seg = np.isin(lab, keep_labels)
 
-                # Check if fallback was successful
-                if np.sum(final_body_mask) > 0:
-                    logger.info(f"Successfully created a fallback body mask for {nifti_path} with {np.sum(final_body_mask)} voxels.")
-                    segmentation_np = final_body_mask
-                else:
-                    logger.error(f"Fallback body mask generation resulted in an empty mask for {nifti_path}. The file will be saved with an empty mask.")
-            except Exception as fallback_e:
-                logger.error(f"Error during fallback mask generation for {nifti_path}: {fallback_e}. The file will be saved with an empty mask.")
+        # Gentle morphology: close small holes, fill, then clamp to body
+        seg = binary_closing(seg, structure=struct, iterations=1)
+        seg = binary_fill_holes(seg)
+        seg = seg & (body_mask > 0)
+        seg = _clear_border_xy_per_slice(seg)
+        lab, n = skimage_label(seg.astype(np.uint8), return_num=True)
+        if n > 2:
+            bc = np.bincount(lab.ravel())
+            order = np.argsort(bc[1:])[::-1] + 1
+            seg = np.isin(lab, order[:2])
 
-        # --- STEP 7: Align mask with image and save ---
-        # Create a SimpleITK image from the numpy mask array.
-        mask_sitk = sitk.GetImageFromArray(segmentation_np.astype(np.uint8))
-        
-        # CRITICAL: Copy the spatial information from the processed CT image to the mask.
-        # This ensures the mask and the image are in the exact same spatial grid.
-        mask_sitk.CopyInformation(resampled_image)
-        
-        # Now, get the numpy array from the correctly aligned SimpleITK image.
-        final_mask = sitk.GetArrayFromImage(mask_sitk)
-        
-        # Save the correctly aligned mask array.
-        np.save(output_path, final_mask)
-        
-        # The metadata now accurately reflects the data being saved.
-        metadata = {
-            'original_filename': os.path.basename(nifti_path),
-            'original_affine': original_affine_nii,
-            'original_spatial_shape': original_shape_nii,
-            'original_spacing': original_spacing_from_affine.tolist(),
-            'original_size': list(original_shape_nii),
-            'original_direction': original_direction.tolist(),
-            'original_origin': original_origin.tolist(),
-            'processed_spacing': list(resampled_image.GetSpacing()),
-            'processed_size': list(resampled_image.GetSize()),
-            'processed_direction': list(resampled_image.GetDirection()),
-            'processed_origin': list(resampled_image.GetOrigin()),
-            'numpy_array_shape_zyx': final_mask.shape,
-            'is_label': True,
-            'target_spacing_if_resampled': target_spacing_xyz if target_spacing_xyz else "N/A"
+        seg = seg.astype(np.uint8)
+
+        np.save(out_path, seg)
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        meta = {
+            "original_filename": os.path.basename(nifti_path),
+            "original_affine": orig_affine.tolist(),
+            "original_spatial_shape": list(orig_shape),
+            "original_spacing": orig_spacing.tolist(),
+            "original_size": list(orig_shape),
+            "original_direction": orig_dir,
+            "original_origin": orig_org,
+            "processed_spacing": list(img_proc.GetSpacing()),
+            "processed_size": list(img_proc.GetSize()),
+            "processed_direction": list(img_proc.GetDirection()),
+            "processed_origin": list(img_proc.GetOrigin()),
+            "numpy_array_shape_zyx": list(seg.shape),
+            "is_label": True,
+            "target_spacing_if_resampled": target_spacing_xyz if target_spacing_xyz else "N/A",
         }
-        
-        base_name = os.path.splitext(os.path.basename(output_path))[0]
-        _save_meta(os.path.join(output_dir, base_name), metadata)
-
+        base = os.path.splitext(os.path.basename(out_path))[0]
+        _save_meta(os.path.join(output_dir, base), meta)
+        del seg, img_proc, img_lps, img_sitk
+        gc.collect()
         return True, None
 
     except Exception as e:
-        error_message = f"CRITICAL ERROR during lung mask generation for {nifti_path}: {str(e)}\n{traceback.format_exc()}"
-        logger.critical(error_message)
-        return False, error_message
+        err = f"Error generating lung mask for {nifti_path}: {e}"
+        logger.critical(err)
+        return False, err
 
-def generate_lung_masks(input_dir, output_dir, num_workers, target_spacing_xyz=None):
-    """
-    Generates lung masks from original NIfTI CT images using the lungmask library.
-    The input_dir should point to the directory of original .nii.gz files.
+
+def generate_lung_masks(input_dir, output_dir, num_workers, target_spacing_xyz=None, force: bool = False,
+                        lungmask_workers: Optional[int] = None,
+                        gpu_concurrency: Optional[int] = None):
+    """Generate lung masks from original NIfTI files with GPU-safe gating.
+
+    - lungmask_workers: total parallel workers doing preprocessing + postprocessing
+    - gpu_concurrency: max concurrent lungmask GPU inferences (1 recommended)
     """
     os.makedirs(output_dir, exist_ok=True)
-    
-    # The input directory should contain the original NIfTI files
     image_files = sorted(glob(os.path.join(input_dir, "*.nii.gz")))
     if not image_files:
         logger.warning(f"No NIfTI image files found in {input_dir}")
         return
 
-    # NEW: Check for GPU and adjust worker count to prevent CUDA OOM with lungmask
-    effective_workers = num_workers
-    if torch.cuda.is_available():
-        logger.info(f"GPU detected. Forcing serial processing (num_workers=2) for lung mask generation to prevent CUDA OOM issues from multiple parallel processes.")
-        effective_workers = 2
-    else:
-        logger.info(f"No GPU detected. Using specified {num_workers} workers for CPU-based processing.")
+    want_gpu = bool(torch.cuda.is_available())
+    env_dev = os.getenv("LUNGMASK_DEVICE", "auto").lower()
+    if env_dev in ("cpu", "0", "false"):
+        want_gpu = False
 
-    logger.info(f"Generating lung masks for {len(image_files)} image files using {effective_workers} worker(s)")
-    
-    # Process each file in parallel
-    results = Parallel(n_jobs=effective_workers)(
-        delayed(process_single_lung_mask)(nifti_path, output_dir, target_spacing_xyz) 
-        for nifti_path in tqdm(image_files, desc="Generating Lung Masks")
+    effective_workers = (
+        int(lungmask_workers) if lungmask_workers is not None else (3 if want_gpu else max(1, int(num_workers)))
     )
-    
-    # Fix: Handle tuple returns from process_single_lung_mask
+    gpu_limit = int(gpu_concurrency) if gpu_concurrency is not None else (1 if want_gpu else 0)
+    logger.info(f"Lungmask device={'cuda' if want_gpu else 'cpu'}; workers={effective_workers}; gpu_concurrency={gpu_limit if want_gpu else 'N/A'}.")
+    gpu_sema = None
+    if want_gpu and gpu_limit > 0:
+        try:
+            manager = multiprocessing.Manager()
+            gpu_sema = manager.Semaphore(gpu_limit)
+        except Exception:
+            gpu_sema = None  # fallback: proceed without gating
+    force_cpu = not want_gpu
+    lm_batch_env = int(os.getenv("LUNGMASK_BATCH", "1" if want_gpu else "8"))
+
+    if effective_workers == 1:
+        results = []
+        for nifti_path in tqdm(image_files, desc="Generating Lung Masks"):
+            results.append(
+                process_single_lung_mask(
+                    nifti_path,
+                    output_dir,
+                    target_spacing_xyz,
+                    force=force,
+                    gpu_semaphore=gpu_sema,
+                    force_cpu=force_cpu,
+                    lm_batch_env=lm_batch_env,
+                )
+            )
+    else:
+        results = Parallel(
+            n_jobs=effective_workers,
+            backend="loky",
+            prefer="processes",
+            pre_dispatch="2*n_jobs",
+        )(
+            delayed(process_single_lung_mask)(
+                nifti_path,
+                output_dir,
+                target_spacing_xyz,
+                force,
+                gpu_sema,
+                force_cpu,
+                lm_batch_env,
+            )
+            for nifti_path in tqdm(image_files, desc="Generating Lung Masks")
+        )
+
     successful_count = sum(1 for r in results if isinstance(r, tuple) and r[0] or r is True)
-    
-    logger.info(f"Lung mask generation complete. {successful_count}/{len(image_files)} files processed successfully. Files saved to {output_dir}")
+    logger.info(f"Lung mask generation complete. {successful_count}/{len(image_files)} succeeded. Saved to {output_dir}")
 
 def verify_single_file(file_info):
-    """Verify a single file and return its verification results."""
     try:
         image_path, label_path, lung_path = file_info
         results = {
@@ -498,31 +661,25 @@ def verify_single_file(file_info):
             'errors': []
         }
 
-        # Check image
         if image_path and os.path.exists(image_path):
             results['has_image'] = True
             image_data = np.load(image_path, allow_pickle=True, mmap_mode='r')
             results['image_shape'] = image_data.shape
-            del image_data  # Free memory
-            gc.collect()
+            del image_data; gc.collect()
 
-        # Check label
         if label_path and os.path.exists(label_path):
             results['has_label'] = True
             label_data = np.load(label_path, allow_pickle=True, mmap_mode='r')
             results['label_shape'] = label_data.shape
             results['label_foreground'] = np.sum(label_data > 0)
-            del label_data
-            gc.collect()
+            del label_data; gc.collect()
 
-        # Check lung mask if provided
         if lung_path and os.path.exists(lung_path):
             results['has_lung'] = True
             lung_data = np.load(lung_path, allow_pickle=True, mmap_mode='r')
             results['lung_shape'] = lung_data.shape
             results['lung_foreground'] = np.sum(lung_data > 0)
-            del lung_data
-            gc.collect()
+            del lung_data; gc.collect()
 
         return results
     except Exception as e:
@@ -531,199 +688,98 @@ def verify_single_file(file_info):
             'errors': [str(e)]
         }
 
+
 def verify_dataset_integrity(images_dir, labels_dir, lungs_dir=None, weights_dir=None, num_workers=-1):
-    """Verify dataset integrity with parallel processing."""
     logger.info("Verifying dataset integrity...")
-    
-    # Get lists of files
     image_files = {os.path.basename(f) for f in glob(os.path.join(images_dir, "*.npy")) if "_metadata" not in f}
     label_files = {os.path.basename(f) for f in glob(os.path.join(labels_dir, "*.npy")) if "_metadata" not in f}
     lung_files = {os.path.basename(f) for f in glob(os.path.join(lungs_dir, "*.npy")) if "_metadata" not in f} if lungs_dir else set()
-    
-    # Create verification tasks
     verification_tasks = []
     all_files = image_files.union(label_files).union(lung_files)
-    
     for filename in all_files:
         image_path = os.path.join(images_dir, filename) if filename in image_files else None
         label_path = os.path.join(labels_dir, filename) if filename in label_files else None
         lung_path = os.path.join(lungs_dir, filename) if filename in lung_files else None
-        if image_path or label_path or lung_path:  # Only add if at least one file exists
+        if image_path or label_path or lung_path:
             verification_tasks.append((image_path, label_path, lung_path))
-    
-    # Process verification tasks in parallel
+
     logger.info(f"Starting parallel verification of {len(verification_tasks)} files using {num_workers} workers...")
     results = Parallel(n_jobs=num_workers, verbose=1)(
         delayed(verify_single_file)(task) for task in verification_tasks
     )
-    
-    # Analyze results
-    issues = {
-        'missing_pairs': [],
-        'shape_mismatches': [],
-        'empty_labels': [],
-        'tiny_labels': [],
-        'empty_lungs': [],
-        'errors': []
-    }
-    
-    for result in results:
-        filename = result['filename']
-        
-        # Check for errors
-        if result.get('errors'):
-            issues['errors'].append((filename, result['errors']))
-            continue
-            
-        # Check for missing pairs
-        if result['has_image'] and not result['has_label']:
+
+    issues = {'missing_pairs': [], 'shape_mismatches': [], 'empty_labels': [], 'tiny_labels': [], 'empty_lungs': [], 'errors': []}
+
+    for r in results:
+        filename = r['filename']
+        if r.get('errors'):
+            issues['errors'].append((filename, r['errors'])); continue
+
+        if r['has_image'] and not r['has_label']:
             issues['missing_pairs'].append(f"{filename} (missing label)")
-        elif result['has_label'] and not result['has_image']:
+        elif r['has_label'] and not r['has_image']:
             issues['missing_pairs'].append(f"{filename} (missing image)")
-            
-        # Check shapes
-        if result['has_image'] and result['has_label']:
-            if result['image_shape'] != result['label_shape']:
-                issues['shape_mismatches'].append(
-                    (filename, result['image_shape'], result['label_shape'])
-                )
-                
-        # Check label foreground
-        if result['has_label']:
-            if result['label_foreground'] == 0:
+
+        if r['has_image'] and r['has_label'] and r['image_shape'] != r['label_shape']:
+            issues['shape_mismatches'].append((filename, r['image_shape'], r['label_shape']))
+
+        if r['has_label']:
+            if r['label_foreground'] == 0:
                 issues['empty_labels'].append(filename)
-            elif result['label_foreground'] < 1000:
-                issues['tiny_labels'].append((filename, result['label_foreground']))
-                
-        # Check lung mask foreground
-        if result['has_lung'] and result['lung_foreground'] == 0:
+            elif r['label_foreground'] < 1000:
+                issues['tiny_labels'].append((filename, r['label_foreground']))
+
+        if r['has_lung'] and r['lung_foreground'] == 0:
             issues['empty_lungs'].append(filename)
-    
-    # Log results
+
     logger.info("\nDataset Verification Results:")
     logger.info(f"Total files checked: {len(results)}")
-    
     if issues['errors']:
         logger.error(f"\nFound {len(issues['errors'])} files with errors:")
-        for filename, errors in issues['errors']:
-            logger.error(f"  - {filename}: {errors}")
-            
+        for filename, errs in issues['errors']:
+            logger.error(f"  - {filename}: {errs}")
     if issues['missing_pairs']:
         logger.warning(f"\nFound {len(issues['missing_pairs'])} incomplete pairs:")
         for item in issues['missing_pairs']:
             logger.warning(f"  - {item}")
-            
     if issues['shape_mismatches']:
         logger.warning(f"\nFound {len(issues['shape_mismatches'])} shape mismatches:")
         for filename, img_shape, label_shape in issues['shape_mismatches']:
             logger.warning(f"  - {filename}: Image {img_shape} vs Label {label_shape}")
-            
     if issues['empty_labels']:
         logger.warning(f"\nFound {len(issues['empty_labels'])} empty label files:")
         for filename in issues['empty_labels']:
             logger.warning(f"  - {filename}")
-            
     if issues['tiny_labels']:
         logger.warning(f"\nFound {len(issues['tiny_labels'])} labels with very few foreground voxels:")
         for filename, count in issues['tiny_labels']:
             logger.warning(f"  - {filename}: {count} voxels")
-            
     if issues['empty_lungs']:
         logger.warning(f"\nFound {len(issues['empty_lungs'])} empty lung masks:")
         for filename in issues['empty_lungs']:
             logger.warning(f"  - {filename}")
-    
+
     valid_count = len(results) - len(issues['missing_pairs']) - len(issues['shape_mismatches'])
     logger.info(f"\nValid paired samples: {valid_count}")
-    
-    return valid_count > 0  # Return True if there are valid samples
+    return valid_count > 0
 
-def _load_and_preprocess_sitk(nifti_path: str, is_label: bool = False) -> sitk.Image | None:
-    """
-    Loads and preprocesses a NIfTI file into a SimpleITK image, applying HU correction if it's not a label.
-    This centralized function has been REWRITTEN to use nibabel for loading to preserve the original
-    coordinate system and prevent SimpleITK's default reorientation. This is critical for data alignment.
-    """
-    try:
-        # STEP 1: Load with nibabel to get the raw data and correct original affine
-        nii_orig = nib.load(nifti_path)
-        data_np = np.asanyarray(nii_orig.dataobj) # Efficiently get data array
-        original_affine = nii_orig.affine
-
-        # STEP 2: Decompose affine to get spacing, direction, and origin
-        spacing = np.sqrt(np.sum(original_affine[:3, :3]**2, axis=0))
-        direction_matrix = original_affine[:3, :3] / spacing
-        origin = original_affine[:3, 3]
-
-        # STEP 3: Create a SimpleITK image from the numpy data and set its metadata explicitly
-        img_sitk = sitk.GetImageFromArray(data_np.transpose()) # Use transpose to match sitk's ZYX axis order
-        img_sitk.SetSpacing(spacing.tolist())
-        img_sitk.SetDirection(direction_matrix.flatten().tolist())
-        img_sitk.SetOrigin(origin.tolist())
-
-        # STEP 4: Apply intensity correction logic (HU values) if it's not a label
-        if is_label:
-            return img_sitk
-
-        # Cast to float32 for calculations
-        itk_image_to_process = sitk.Cast(img_sitk, sitk.sitkFloat32)
-
-        # Check for rescale slope and intercept in NIfTI header metadata
-        if nii_orig.header.get_slope_inter():
-            slope, intercept = nii_orig.header.get_slope_inter()
-            if slope is not None and intercept is not None and (slope != 1.0 or intercept != 0.0):
-                logger.info(f"Applying rescale slope ({slope}) and intercept ({intercept}) from NIfTI header for {os.path.basename(nifti_path)}.")
-                itk_image_to_process = itk_image_to_process * slope + intercept
-                return itk_image_to_process
-
-        # Fallback for integer-type images missing explicit rescale tags
-        if img_sitk.GetPixelIDValue() in (sitk.sitkUInt16, sitk.sitkInt16, sitk.sitkUInt8, sitk.sitkInt8):
-            stats_filter = sitk.StatisticsImageFilter()
-            stats_filter.Execute(img_sitk)
-            # If the minimum value is non-negative, it's likely raw data that needs a standard offset
-            if stats_filter.GetMinimum() >= 0:
-                fn = os.path.basename(nifti_path)
-                logger.info(f"File {fn} appears to be raw scanner data (no rescale tags). Applying common HU intercept of -1024.")
-                itk_image_to_process -= 1024.0
-        
-        return itk_image_to_process
-
-    except Exception as e:
-        logger.error(f"CRITICAL ERROR during nibabel/SITK loading/preprocessing for {nifti_path}: {str(e)}\n{traceback.format_exc()}")
-        return None
 def calculate_average_spacing(nifti_files: List[str]) -> Optional[Tuple[float, float, float]]:
-    """
-    Calculates the average voxel spacing from a list of NIfTI files.
-
-    Args:
-        nifti_files (List[str]): A list of paths to NIfTI files.
-
-    Returns:
-        Optional[Tuple[float, float, float]]: A tuple containing the average
-        spacing along each axis (x, y, z), or None if no files are provided.
-    """
     if not nifti_files:
         return None
-
-    total_spacing = np.array([0.0, 0.0, 0.0])
-    num_files = 0
-
+    total_spacing = np.array([0.0, 0.0, 0.0]); num_files = 0
     for file_path in tqdm(nifti_files, desc="Calculating Average Spacing"):
         try:
             nii_orig = nib.load(file_path)
             affine = nii_orig.affine
             spacing = np.sqrt(np.sum(affine[:3, :3]**2, axis=0))
-            total_spacing += spacing
-            num_files += 1
+            total_spacing += spacing; num_files += 1
         except Exception as e:
             logger.warning(f"Could not read spacing from {file_path}: {e}")
-
     if num_files == 0:
         return None
-
-    average_spacing = total_spacing / num_files
-    logger.info(f"Calculated average spacing: {average_spacing.tolist()}")
-    return tuple(average_spacing)
+    avg = total_spacing / num_files
+    logger.info(f"Calculated average spacing: {avg.tolist()}")
+    return tuple(avg)
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare ATM22 dataset for airway segmentation")
@@ -733,155 +789,143 @@ def main():
     parser.add_argument("--sigma", type=float, default=20, help="Sigma parameter for weight maps")
     parser.add_argument("--decay", type=float, default=5, help="Decay factor for weight maps")
     parser.add_argument("--generate_lungs", action="store_true", help="Generate lung masks")
+    parser.add_argument("--force_lungs", action="store_true", help="Regenerate lung masks even if files exist")  # NEW
     parser.add_argument("--process_validation", action="store_true", help="Process validation data")
     parser.add_argument("--force_recreate", action="store_true", help="Force recreation of npy files")
     parser.add_argument("--verify_only", action="store_true", help="Only verify the existing dataset without conversion")
-    parser.add_argument("--num_workers", type=int, default=-1, help="Number of worker processes to use for parallel tasks. Defaults to all available CPUs for joblib, or specific defaults for other parallelized functions.")
-    parser.add_argument("--threshold", type=float, default=-1000, help="Threshold for lung mask generation (in raw intensity units)")
-    parser.add_argument("--target_spacing", type=float, nargs=3, default=None, 
-                        help="Target spacing for resampling (e.g., 1.2 1.2 1.2). No resampling if None.")
+    parser.add_argument("--num_workers", type=int, default=-1, help="Workers for parallel tasks")
+    parser.add_argument("--target_spacing", type=float, nargs=3, default=None, help="Target spacing (e.g., 1.2 1.2 1.2)")
+    parser.add_argument("--lungmask_workers", type=int, default=None, help="Total workers for lungmask preprocessing/postprocessing")
+    parser.add_argument("--lungmask_gpu_limit", type=int, default=None, help="Max concurrent GPU lungmask inferences (recommend 1)")
     args = parser.parse_args()
-    
-    # Check if dataset path exists
+
     dataset_path = args.dataset_path
-    parent_directory = os.path.dirname(dataset_path)
     output_path = os.path.join(dataset_path, "npy_files")
-    
-    # Create output directories
     images_output = os.path.join(output_path, "imagesTr")
     labels_output = os.path.join(output_path, "labelsTr")
-    lungs_output = os.path.join(output_path, "lungsTr")
+    lungs_output  = os.path.join(output_path, "lungsTr")
     weights_output = os.path.join(output_path, "Wr1alpha0.2")
-    
     val_output = os.path.join(dataset_path, "val")
     val_lungs_output = os.path.join(dataset_path, "val_lungs")
-    
     os.makedirs(output_path, exist_ok=True)
     os.makedirs(val_output, exist_ok=True)
     os.makedirs(val_lungs_output, exist_ok=True)
     os.makedirs(weights_output, exist_ok=True)
-    
-    # Verify mode - only check existing data
+
     if args.verify_only:
-        logger.info("Running in verification-only mode")
+        logger.info("Verification-only mode")
         verify_dataset_integrity(images_output, labels_output, lungs_output, weights_output)
         return
-    
-    conversion_workers = args.num_workers if args.num_workers != -1 else os.cpu_count() or 4
-    conversion_workers = min(conversion_workers, 8) # Cap at 8 to avoid excessive overhead
-    
-    # --- Automatic Target Spacing Calculation ---
+
+    conversion_workers = args.num_workers if args.num_workers != -1 else (os.cpu_count() or 4)
+    conversion_workers = min(conversion_workers, 8)
+
+    # Auto target spacing if not provided
     target_spacing = args.target_spacing
     if target_spacing is None:
-        logger.info("Target spacing not provided. Calculating average spacing from all input NIfTI images...")
+        logger.info("Target spacing not provided. Calculating average spacing from input NIfTI images...")
         all_image_files_to_process = []
-        
-        # Collect potential training image files from batch 1
         if args.batch1:
-            images_path_b1 = os.path.join(dataset_path, args.batch1, "imagesTr")
-            if os.path.exists(images_path_b1):
-                all_image_files_to_process.extend(glob(os.path.join(images_path_b1, "*.nii.gz")))
-        
-        # Collect potential training image files from batch 2
+            p = os.path.join(dataset_path, args.batch1, "imagesTr")
+            if os.path.exists(p): all_image_files_to_process.extend(glob(os.path.join(p, "*.nii.gz")))
         if args.batch2:
-            images_path_b2 = os.path.join(dataset_path, args.batch2, "imagesTr")
-            if os.path.exists(images_path_b2):
-                all_image_files_to_process.extend(glob(os.path.join(images_path_b2, "*.nii.gz")))
-        
-        # Collect potential validation image files
+            p = os.path.join(dataset_path, args.batch2, "imagesTr")
+            if os.path.exists(p): all_image_files_to_process.extend(glob(os.path.join(p, "*.nii.gz")))
         if args.process_validation:
-            val_images_path = os.path.join(dataset_path, "imagesVal")
-            if os.path.exists(val_images_path):
-                all_image_files_to_process.extend(glob(os.path.join(val_images_path, "*.nii.gz")))
-                
+            p = os.path.join(dataset_path, "imagesVal")
+            if os.path.exists(p): all_image_files_to_process.extend(glob(os.path.join(p, "*.nii.gz")))
         if all_image_files_to_process:
             target_spacing = calculate_average_spacing(all_image_files_to_process)
             if target_spacing:
-                 logger.info(f"Using automatically calculated average spacing for resampling: {target_spacing}")
-        else:
-            logger.warning("No NIfTI files found to calculate average spacing. Resampling will be skipped.")
+                logger.info(f"Using automatically calculated average spacing: {target_spacing}")
     else:
         logger.info(f"Using user-provided target spacing: {target_spacing}")
 
-    # Process TrainBatch1
+    # TrainBatch1
     if args.batch1:
-        batch1_path = os.path.join(dataset_path, args.batch1)
-        logger.info(f"Processing {batch1_path}")
-        
-        # Convert images
-        images_path = os.path.join(batch1_path, "imagesTr")
+        b1 = os.path.join(dataset_path, args.batch1)
+        logger.info(f"Processing {b1}")
+        images_path = os.path.join(b1, "imagesTr")
         if os.path.exists(images_path):
-            convert_nifti_to_numpy(images_path, images_output, is_label=False, target_spacing_xyz=target_spacing, num_workers=conversion_workers)
-        
-        # Convert labels
-        labels_path = os.path.join(batch1_path, "labelsTr")
+            convert_nifti_to_numpy(images_path, images_output, is_label=False, target_spacing_xyz=target_spacing,
+                                   num_workers=conversion_workers, force=args.force_recreate)
+        labels_path = os.path.join(b1, "labelsTr")
         if os.path.exists(labels_path):
-            convert_nifti_to_numpy(labels_path, labels_output, is_label=True, target_spacing_xyz=target_spacing, num_workers=conversion_workers)
+            convert_nifti_to_numpy(labels_path, labels_output, is_label=True, target_spacing_xyz=target_spacing,
+                                   num_workers=conversion_workers, force=args.force_recreate)
 
-    # Process TrainBatch2
+    # TrainBatch2
     if args.batch2:
-        batch2_path = os.path.join(dataset_path, args.batch2)
-        logger.info(f"Processing {batch2_path}")
-        
-        # Convert images
-        images_path = os.path.join(batch2_path, "imagesTr")
+        b2 = os.path.join(dataset_path, args.batch2)
+        logger.info(f"Processing {b2}")
+        images_path = os.path.join(b2, "imagesTr")
         if os.path.exists(images_path):
-            convert_nifti_to_numpy(images_path, images_output, is_label=False, target_spacing_xyz=target_spacing, num_workers=conversion_workers)
-
-        # Convert labels
-        labels_path = os.path.join(batch2_path, "labelsTr")
+            convert_nifti_to_numpy(images_path, images_output, is_label=False, target_spacing_xyz=target_spacing,
+                                   num_workers=conversion_workers, force=args.force_recreate)
+        labels_path = os.path.join(b2, "labelsTr")
         if os.path.exists(labels_path):
-            convert_nifti_to_numpy(labels_path, labels_output, is_label=True, target_spacing_xyz=target_spacing, num_workers=conversion_workers)
+            convert_nifti_to_numpy(labels_path, labels_output, is_label=True, target_spacing_xyz=target_spacing,
+                                   num_workers=conversion_workers, force=args.force_recreate)
 
-    # Process validation data
+    # Validation
     if args.process_validation:
         val_images_path = os.path.join(dataset_path, "imagesVal")
         if os.path.exists(val_images_path):
             logger.info(f"Processing validation images from {val_images_path}")
-            
-            # Generate lung masks for validation data from original NIfTI files FIRST
             if args.generate_lungs:
-                logger.info("Generating lung masks for validation data from original NIfTI files...")
-                generate_lung_masks(val_images_path, val_lungs_output, num_workers=args.num_workers, target_spacing_xyz=target_spacing)
+                logger.info("Generating lung masks for validation data (from original NIfTI files)...")
+                generate_lung_masks(
+                    val_images_path,
+                    val_lungs_output,
+                    num_workers=args.num_workers,
+                    target_spacing_xyz=target_spacing,
+                    force=args.force_lungs,
+                    lungmask_workers=args.lungmask_workers,
+                    gpu_concurrency=args.lungmask_gpu_limit,
+                )
+            convert_nifti_to_numpy(val_images_path, val_output, is_label=False, target_spacing_xyz=target_spacing,
+                                   num_workers=conversion_workers, force=args.force_recreate)
+            logger.info("Validation data processing complete.")
 
-            # Then, apply the conversion/resampling pipeline to the NIfTI images
-            convert_nifti_to_numpy(val_images_path, val_output, is_label=False, target_spacing_xyz=target_spacing, num_workers=conversion_workers)
-            
-            logger.info(f"Validation data processing complete.")
-    
-    # Check if directories exist before proceeding
+    # Sanity checks on output dirs
     if not os.path.exists(images_output):
         logger.error(f"Images directory {images_output} does not exist. Exiting.")
         return
-    
     if not os.path.exists(labels_output):
         logger.error(f"Labels directory {labels_output} does not exist. Exiting.")
         return
-    
-    # Generate lung masks if requested, now from the original NIfTI directories
+
+    # Training set lung masks (from original NIfTI dirs)
     if args.generate_lungs:
-        logger.info("Generating lung masks for training set from original NIfTI files...")
-        # Assume images are in batch1_path/imagesTr and batch2_path/imagesTr
+        logger.info("Generating lung masks for training set...")
         if args.batch1:
-            generate_lung_masks(os.path.join(dataset_path, args.batch1, "imagesTr"), lungs_output, num_workers=args.num_workers, target_spacing_xyz=target_spacing)
+            generate_lung_masks(
+                os.path.join(dataset_path, args.batch1, "imagesTr"),
+                lungs_output,
+                num_workers=args.num_workers,
+                target_spacing_xyz=target_spacing,
+                force=args.force_lungs,
+                lungmask_workers=args.lungmask_workers,
+                gpu_concurrency=args.lungmask_gpu_limit,
+            )
         if args.batch2:
-            generate_lung_masks(os.path.join(dataset_path, args.batch2, "imagesTr"), lungs_output, num_workers=args.num_workers, target_spacing_xyz=target_spacing)
-        
+            generate_lung_masks(
+                os.path.join(dataset_path, args.batch2, "imagesTr"),
+                lungs_output,
+                num_workers=args.num_workers,
+                target_spacing_xyz=target_spacing,
+                force=args.force_lungs,
+                lungmask_workers=args.lungmask_workers,
+                gpu_concurrency=args.lungmask_gpu_limit,
+            )
         logger.info("Lung mask generation finished.")
 
-    # Generate weight maps if labels are available
-    # if os.path.exists(labels_output) and any(glob(os.path.join(labels_output, "*.npy"))):
-    #     logger.info("Generating weight maps...")
-    #     generate_weight_maps(labels_output, weights_output, sigma=args.sigma, decay_factor=args.decay, num_workers=num_workers)
-    #     logger.info("Weight map generation finished.")
-    # else:
-    #     logger.info("Label directory for training not found or empty, skipping weight map generation.")
-    
-    # Run verification to check dataset integrity
+    # Verify
     verify_dataset_integrity(images_output, labels_output, lungs_output, weights_output)
-    
+
     if args.process_validation:
         logger.info(f"Prepared validation dataset is in: {val_output} and {val_lungs_output}")
+
 
 if __name__ == "__main__":
     main()

@@ -3,7 +3,10 @@ import os
 from scipy import ndimage
 import skimage.measure as measure
 import nibabel
-from skimage.morphology import skeletonize
+try:
+    from skimage.morphology import skeletonize_3d as _skeletonize_3d  # noqa: F401
+except ImportError:  # Newer scikit-image
+    from skimage.morphology import skeletonize as _skeletonize_3d  # type: ignore
 import torch
 from monai.metrics import DiceMetric
 from typing import Tuple, Dict, Any, Optional, List, Union
@@ -12,6 +15,8 @@ from monai.utils import MetricReduction
 
 def large_connected_domain(label):
     cd, num = measure.label(label, return_num=True, connectivity=1)
+    if num == 0:
+        return np.zeros_like(label, dtype=np.uint8)
     volume = np.zeros([num])
     for k in range(num):
         volume[k] = ((cd == (k + 1)).astype(np.uint8)).sum()
@@ -24,20 +29,20 @@ def large_connected_domain(label):
 
 def skeleton_parsing(skeleton):
     # separate the skeleton
-    neighbor_filter = ndimage.generate_binary_structure(3, 3)
-    skeleton_filtered = ndimage.convolve(skeleton,
-    neighbor_filter) * skeleton
-    # distribution = skeleton_filtered[skeleton_filtered>0]
-    # plt.hist(distribution)
+    neighbor_filter = ndimage.generate_binary_structure(3, 3)  # 26-neighborhood
+    # Count neighbors including self, then subtract self to get degree on skeleton
+    nb = ndimage.convolve(skeleton.astype(np.uint8), neighbor_filter, mode="constant", cval=0) * skeleton
+    deg = (nb - 1) * skeleton  # neighbors excluding self on the skeleton
+
     skeleton_parse = skeleton.copy()
-    skeleton_parse[skeleton_filtered > 6] = 0  # was >3, retain more voxels for junctions
+    skeleton_parse[deg >= 3] = 0  # break at junctions (>=3 neighbors)
     con_filter = ndimage.generate_binary_structure(3, 3)
     cd, num = ndimage.label(skeleton_parse,
     structure=con_filter)
     # remove small branches
     for i in range(num):
         a = cd[cd == (i + 1)]
-        if a.shape[0] < 2:  # was <3, keep slightly shorter branches
+        if a.shape[0] < 3:  # drop stubs smaller than 3 voxels
             skeleton_parse[cd == (i + 1)] = 0
     cd, num = ndimage.label(skeleton_parse,
     structure=con_filter)
@@ -63,7 +68,7 @@ def loc_trachea(tree_parsing, num):
 def get_parsing(mask, refine=False):
     mask = (mask > 0).astype(np.uint8)
     mask = large_connected_domain(mask)
-    skeleton = skeletonize(mask)
+    skeleton = _skeletonize_3d(mask)
     skeleton_parse, cd, num = skeleton_parsing(skeleton)
     tree_parsing = tree_parsing_func(skeleton_parse, mask, cd)
     return tree_parsing
@@ -102,11 +107,11 @@ class AirwayMetrics(torchmetrics.Metric):
             lungs: Optional lung mask for masked evaluation (B, 1, D, H, W)
         """
         if not pred.is_cuda:
-            pred = pred.cuda()
+            pred = pred.device()
         if not target.is_cuda:
-            target = target.cuda()
+            target = target.device()
         if lungs is not None and not lungs.is_cuda:
-            lungs = lungs.cuda()
+            lungs = lungs.device()
         
         # Standard Dice metric (using MONAI's implementation)
         dice_value = self.dice_metric(pred, target)
@@ -122,8 +127,9 @@ class AirwayMetrics(torchmetrics.Metric):
             
             # Compute binary IoU
             from .topo_metrics import compute_binary_iou
-            iou = compute_binary_iou(t, p, lungs=l)
-            self.iou_scores.append(torch.tensor(float(iou), dtype=torch.float32).cuda())
+            if l is not None:
+                iou = compute_binary_iou(t, p, lungs=l)
+                self.iou_scores.append(torch.tensor(float(iou), dtype=torch.float32).cuda())
 
             try:
                 parsing_t = get_parsing(t, refine=False)

@@ -8,23 +8,14 @@ from typing import Dict, List, Tuple, Union
 
 import numpy as np
 from monai.transforms.transform import MapTransform
-from monai.transforms.spatial.dictionary import SpatialCropd
-
+from monai.transforms.croppad.dictionary import SpatialCropd
+from monai.transforms.croppad.dictionary import CenterSpatialCropd
 
 class SamplePatchFromBankd(MapTransform):
     """
     Sample patches deterministically from precomputed patch banks using static, audit-derived
     weights. At call-time, weights are normalized into sampling probabilities with an optional
     temperature to control sharpness.
-
-    Args:
-        keys: keys to extract/crop (e.g., ["image","label","lung"]) from current sample
-        patch_banks_dir: directory containing per-case .pkl.gz patch banks (one per case)
-        spatial_size: (z, y, x) patch size in voxels
-        num_samples: number of patches to draw (first replaces in-place, additional get suffixed)
-        pos_ratio: probability to draw from positive patches (fg_fraction > threshold)
-        temperature: softmax temperature applied to per-patch weights (lower=sharper)
-        fg_threshold: threshold on fg_fraction to consider a patch positive
     """
 
     def __init__(
@@ -36,6 +27,10 @@ class SamplePatchFromBankd(MapTransform):
         pos_ratio: float = 0.9,
         temperature: float = 1.0,
         fg_threshold: float = 1e-4,
+        # Optional landmark-aware sampling
+        use_landmarks: bool = False,
+        quota_bifurcation: float = 0.0,
+        quota_trachea: float = 0.0,
         allow_missing_keys: bool = False,
     ) -> None:
         super().__init__(keys=keys, allow_missing_keys=allow_missing_keys)
@@ -45,6 +40,9 @@ class SamplePatchFromBankd(MapTransform):
         self.pos_ratio = float(pos_ratio)
         self.temperature = max(1e-6, float(temperature))
         self.fg_threshold = float(fg_threshold)
+        self.use_landmarks = bool(use_landmarks)
+        self.quota_bifurcation = max(0.0, min(1.0, float(quota_bifurcation)))
+        self.quota_trachea = max(0.0, min(1.0, float(quota_trachea)))
 
         self._banks: Dict[str, Dict[str, List[Dict]]] = {}
         self._bank_meta: Dict[str, Dict] = {}
@@ -53,7 +51,6 @@ class SamplePatchFromBankd(MapTransform):
 
     # ---- helpers ----
     def _extract_case_id(self, data: Dict) -> str:
-        # Prefer meta dict path if present
         meta = data.get("image_meta_dict")
         path_str = None
         if isinstance(meta, dict):
@@ -63,7 +60,7 @@ class SamplePatchFromBankd(MapTransform):
             elif isinstance(v, (str, Path)):
                 path_str = str(v)
         if path_str is None and "image" in data:
-            # Try tensor meta if available
+            #try tensor meta if available
             img = data["image"]
             try:
                 v = getattr(img, "meta", {}).get("filename_or_obj")
@@ -94,7 +91,6 @@ class SamplePatchFromBankd(MapTransform):
             patch_list = obj
             meta = {}
         self._bank_meta[case_id] = meta
-        # Optional guard on patch size
         expected_ps = tuple(meta.get("patch_size") or ())
         if expected_ps and tuple(int(v) for v in expected_ps) != self.spatial_size:
             print(
@@ -105,12 +101,19 @@ class SamplePatchFromBankd(MapTransform):
             self._warned_patchsize_missing = True
         pos = [p for p in patch_list if float(p.get("fg_fraction", 0.0)) > self.fg_threshold]
         bg = [p for p in patch_list if float(p.get("fg_fraction", 0.0)) <= self.fg_threshold]
-        self._banks[case_id] = {"positive": pos, "background": bg}
+        # Optional landmark pools (may overlap with pos/bg)
+        if self.use_landmarks:
+            bif = [p for p in patch_list if bool(p.get("is_bifurcation", False))]
+            tra = [p for p in patch_list if bool(p.get("is_trachea", False))]
+        else:
+            bif, tra = [], []
+        self._banks[case_id] = {"positive": pos, "background": bg, "bifurcation": bif, "trachea": tra}
         return self._banks[case_id]
 
     def _softmax_choice(self, patches: List[Dict]) -> Dict:
         if not patches:
             raise RuntimeError("No patches provided to _softmax_choice")
+        # here, sampling_weight is the weight of the patch, where the higher the weight, the more likely it is to be sampled
         w = np.array([float(p.get("sampling_weight", 1.0)) for p in patches], dtype=np.float64)
         # temperature scaling in probability space: p_i ∝ w_i^(1/temperature)
         w = np.clip(w, 1e-8, 1e8)
@@ -125,24 +128,45 @@ class SamplePatchFromBankd(MapTransform):
         idx = int(np.random.choice(len(patches), p=probs))
         return patches[idx]
 
-    # ---- main ----
     def __call__(self, data: Dict) -> Dict:
         d = dict(data)
         case_id = self._extract_case_id(d)
         bank = self._load_bank_for_case(case_id)
         candidates_pos = bank.get("positive", [])
         candidates_bg = bank.get("background", [])
-        # Fallback: if bank missing, return input unchanged
+        # Fallback: if bank missing or empty, center-crop to requested spatial_size
         if not candidates_pos and not candidates_bg:
-            return d
+            print(f"[SamplePatchFromBankd] No patches found for case {case_id}; applying CenterSpatialCropd with roi_size={self.spatial_size}")
+            crop = CenterSpatialCropd(keys=self.keys, roi_size=self.spatial_size, allow_missing_keys=True)
+            return crop(d)
 
         selected: List[Dict] = []
         for _ in range(max(1, self.num_samples)):
-            draw_pos = (random.random() < self.pos_ratio) and bool(candidates_pos)
-            pool = candidates_pos if draw_pos else (candidates_bg if candidates_bg else candidates_pos)
-            chosen = self._softmax_choice(pool)
+            # Optional landmark quotas: attempt first if enabled
+            chosen = None
+            if self.use_landmarks and (self.quota_bifurcation > 0 or self.quota_trachea > 0):
+                if (random.random() < self.quota_bifurcation) and bank.get("bifurcation"):
+                    chosen = self._softmax_choice(bank["bifurcation"])  # type: ignore[arg-type]
+                elif (random.random() < self.quota_trachea) and bank.get("trachea"):
+                    chosen = self._softmax_choice(bank["trachea"])  # type: ignore[arg-type]
+            if chosen is None:
+                draw_pos = (random.random() < self.pos_ratio) and bool(candidates_pos)
+                pool = candidates_pos if draw_pos else (candidates_bg if candidates_bg else candidates_pos)
+                chosen = self._softmax_choice(pool)
+             # Lightweight debug: infer the source without relying on draw_pos existing
+            if random.random() < 0.05:  # sample ~5% for logging
+                if chosen in candidates_pos:
+                    src = "pos"
+                elif chosen in candidates_bg:
+                    src = "bg"
+                else:
+                    src = "lm"  # landmark (bifurcation/trachea)
+                try:
+                    fg = float(chosen.get("fg_fraction", -1.0))
+                except Exception:
+                    fg = -1.0
+                print(f"[PB] case={case_id} src={src} fg={fg:.2e}")
             selected.append(chosen)
-
         # Apply SpatialCropd so meta is updated consistently
         for i, patch_desc in enumerate(selected):
             z, y, x = tuple(int(v) for v in patch_desc.get("position_zyx", patch_desc.get("position", (0, 0, 0))))
