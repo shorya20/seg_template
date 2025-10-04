@@ -1,5 +1,4 @@
-# Create a README.md file for the user's project with dataset links and step-by-step instructions.
-readme = r"""# Airway Segmentation (ATM22) — Non‑Uniform Patch Sampling Project
+# Airway Segmentation (ATM22) — Non‑Uniform Patch Sampling Project
 
 This repository contains a 3D airway segmentation pipeline for the **ATM22 (Airway Tree Modeling 2022)** datasets with an emphasis on **non‑uniform patch sampling** and **topology‑aware training** (e.g., MONAI 1.5.0 `SoftclDiceLoss`). It includes SLURM-ready scripts for HPC, as well as Python-only commands for local runs.
 
